@@ -13,3 +13,7 @@ media/
 *.db
 *.db-wal
 *.db-shm
+
+# Runtime
+logs/
+run/

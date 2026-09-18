@@ -10,6 +10,7 @@ if str(_ROOT) not in sys.path:
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import time
 import urllib.parse
@@ -116,7 +117,12 @@ def _kill_pid_os(pid: int) -> None:
                 timeout=10,
             )
         else:
-            subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=10)
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGKILL)
+            except Exception:
+                subprocess.run(
+                    ["kill", "-9", str(pid)], capture_output=True, timeout=10
+                )
     except Exception:
         logger.warning("Could not kill pid %s", pid)
 
@@ -195,11 +201,14 @@ def build_serve_command(host: str, port: int) -> list[str]:
     return [resolved, "serve", "--port", str(port), "--hostname", host]
 
 
-def start_server(command: list[str]) -> subprocess.Popen:
-    creationflags = 0
+def _popen_kwargs() -> dict:
     if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-    return subprocess.Popen(command, cwd=str(_ROOT), creationflags=creationflags)
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def start_server(command: list[str]) -> subprocess.Popen:
+    return subprocess.Popen(command, cwd=str(_ROOT), **_popen_kwargs())
 
 
 def wait_for_health(

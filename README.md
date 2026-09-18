@@ -150,6 +150,36 @@ secret the launcher needs; set the keys above in `.env`.
 To revert to long polling, empty `TELEGRAM_WEBHOOK_URL` (the launcher then skips
 cloudflared and the bot polls).
 
+## Running it
+
+Manage the launcher as a background process with the helper scripts:
+
+```powershell
+scripts\bot.ps1 start     # start in the background (logs to logs\bot.out.log / logs\bot.err.log)
+scripts\bot.ps1 status    # launcher pid, opencode port, health
+scripts\bot.ps1 stop      # stop the bot and the opencode server it manages (never cloudflared)
+```
+
+```bash
+./scripts/bot.sh start
+./scripts/bot.sh status
+./scripts/bot.sh stop
+```
+
+The pid file lives in `run/bot.pid` and logs in `logs/` (both gitignored).
+`stop` also terminates the process listening on the configured opencode port;
+it never touches cloudflared — the launcher's own `finally` stops the tunnel it
+started. `status` exits non-zero when nothing is running.
+
+### Cross-platform
+
+Linux/macOS work too (no Windows-only assumptions in the Python code; the
+scripts have POSIX counterparts). Prerequisites: Python 3.14+ with a
+`.venv` (`.venv/bin/python`), `opencode` on `PATH`, and — for webhook mode —
+`cloudflared` configured via `CLOUDFLARED_COMMAND` (an absolute path is fine).
+`scripts/bot.sh` uses `lsof` for port lookup when available and falls back to
+`psutil`; `curl` is used for health when present, otherwise the venv Python.
+
 ## Commands
 
 | Command | Description |

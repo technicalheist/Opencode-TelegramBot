@@ -108,6 +108,63 @@ def test_build_serve_command_missing(monkeypatch):
         launcher.build_serve_command("127.0.0.1", 4096)
 
 
+def test_build_serve_command_posix_not_wrapped(monkeypatch):
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setattr(
+        launcher.shutil, "which", lambda command: "/usr/local/bin/opencode"
+    )
+
+    command = launcher.build_serve_command("127.0.0.1", 4096)
+
+    assert command == [
+        "/usr/local/bin/opencode",
+        "serve",
+        "--port",
+        "4096",
+        "--hostname",
+        "127.0.0.1",
+    ]
+
+
+def test_build_serve_command_posix_does_not_wrap_cmd_like_name(monkeypatch):
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setattr(
+        launcher.shutil, "which", lambda command: "/usr/local/bin/opencode.cmd"
+    )
+
+    command = launcher.build_serve_command("127.0.0.1", 4096)
+
+    assert command[0] == "/usr/local/bin/opencode.cmd"
+    assert command[1] == "serve"
+    assert "COMSPEC" not in command
+
+
+def test_popen_kwargs_posix(monkeypatch):
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    assert launcher._popen_kwargs() == {"start_new_session": True}
+
+
+def test_popen_kwargs_windows(monkeypatch):
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    assert launcher._popen_kwargs() == {
+        "creationflags": launcher.subprocess.CREATE_NEW_PROCESS_GROUP
+    }
+
+
+def test_kill_pid_os_posix_uses_process_group(monkeypatch):
+    calls = []
+    monkeypatch.setattr(launcher.os, "name", "posix")
+    monkeypatch.setattr(launcher.signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(launcher.os, "getpgid", lambda pid: pid, raising=False)
+    monkeypatch.setattr(
+        launcher.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)), raising=False
+    )
+
+    launcher._kill_pid_os(42)
+
+    assert calls and calls[0][0] == 42
+
+
 def test_stop_existing_server_no_pid(monkeypatch):
     monkeypatch.setattr(launcher, "find_listening_pid", lambda port: None)
     killed: list[int] = []

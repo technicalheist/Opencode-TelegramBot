@@ -66,6 +66,14 @@ registers `https://<host>/<TELEGRAM_WEBHOOK_PATH>` with Telegram (secret
 cloudflared tunnel (`CLOUDFLARED_COMMAND`, `CLOUDFLARED_TUNNEL_TOKEN`) for the
 public HTTPS URL. Empty `TELEGRAM_WEBHOOK_URL` keeps long polling.
 
+### Start/stop/status scripts
+
+For a background launcher managed from the shell, use `scripts\bot.ps1
+start|stop|status` (Windows) or `./scripts/bot.sh start|stop|status`
+(Linux/macOS). Pid file in `run/bot.pid`, logs in `logs/` (gitignored); `stop`
+also stops the opencode server on the configured port and never touches
+cloudflared.
+
 ## Commands
 
 - `/start`, `/help` - welcome and command list.
