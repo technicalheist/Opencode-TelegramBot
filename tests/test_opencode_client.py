@@ -950,6 +950,80 @@ async def test_get_last_assistant_message_returns_last_with_parts(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_turn_assistant_parts_only_after_last_user(tmp_path):
+    messages = [
+        {
+            "info": {"role": "assistant"},
+            "parts": [{"type": "text", "text": "old turn"}],
+        },
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "do it"}]},
+        {
+            "info": {"role": "assistant"},
+            "parts": [{"type": "patch", "files": ["a.png"]}],
+        },
+        {
+            "info": {"role": "assistant"},
+            "parts": [
+                {"type": "file", "url": "file:///b.png"},
+                {"type": "text", "text": "done"},
+            ],
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/session/ses_1/message"
+        assert request.url.params.get("directory") == str(tmp_path)
+        return httpx.Response(200, json=messages)
+
+    oc = _make(handler, tmp_path)
+    parts = await oc.get_turn_assistant_parts("ses_1")
+
+    assert [part["type"] for part in parts] == ["patch", "file", "text"]
+    assert parts[0]["files"] == ["a.png"]
+
+
+@pytest.mark.asyncio
+async def test_get_turn_assistant_parts_empty_after_user_without_assistant(tmp_path):
+    messages = [
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "a"}]},
+        {"info": {"role": "user"}, "parts": [{"type": "text", "text": "b"}]},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=messages)
+
+    oc = _make(handler, tmp_path)
+    assert await oc.get_turn_assistant_parts("ses_1") == []
+
+
+@pytest.mark.asyncio
+async def test_get_turn_assistant_parts_falls_back_without_user(tmp_path):
+    messages = [
+        {
+            "info": {"role": "assistant"},
+            "parts": [{"type": "text", "text": "solo"}],
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=messages)
+
+    oc = _make(handler, tmp_path)
+    parts = await oc.get_turn_assistant_parts("ses_1")
+    assert parts == [{"type": "text", "text": "solo"}]
+
+
+@pytest.mark.asyncio
+async def test_get_turn_assistant_parts_raises_on_error(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    oc = _make(handler, tmp_path)
+    with pytest.raises(OpenCodeError):
+        await oc.get_turn_assistant_parts("ses_1")
+
+
+@pytest.mark.asyncio
 async def test_get_last_assistant_message_returns_none(tmp_path):
     messages = [
         {"info": {"role": "user"}, "parts": [{"type": "text", "text": "hi"}]},

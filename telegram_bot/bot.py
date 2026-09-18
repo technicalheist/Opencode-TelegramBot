@@ -23,7 +23,7 @@ from telegram.ext import (
 
 import config
 from opencode_client import OpenCodeClient
-from telegram_bot import database, handlers, storage
+from telegram_bot import database, handlers, opencode_setup, storage
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,11 @@ async def post_init(application: Application) -> None:
     config.ensure_dirs()
     database.init_db()
     database.seed_admin(config.ADMIN_USER_ID)
+    try:
+        setup_result = opencode_setup.install_all()
+        logger.info("opencode setup install result: %s", setup_result)
+    except Exception:
+        logger.exception("opencode setup install failed")
     application.bot_data["opencode"] = OpenCodeClient()
     application.bot_data["user_locks"] = handlers.USER_LOCKS
     application.bot_data["sse_task"] = application.create_task(

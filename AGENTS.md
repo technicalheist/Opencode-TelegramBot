@@ -164,6 +164,47 @@ currently ignores them.
 - [x] Only authenticated users; errors shown, not raised.
 - [x] Tests (no network).
 
+### Phase 6 - explicit Telegram send (MCP tool + global skill) (CURRENT)
+The pull-based patch/file method stays, but it is inference-based. Add an
+explicit, reliable path: a local MCP tool the agent can call, plus a global
+skill that documents the fallback CLI. Both are installed globally when the bot
+starts (skip if already present).
+
+- [ ] `telegram_bot/send_media.py` — CLI: `python -m telegram_bot.send_media
+      <path> [--caption TEXT] [--chat-id ID]` sends a file via the Bot API.
+- [ ] `telegram_bot/mcp_server.py` — local stdio MCP server exposing a
+      `telegram_send_file(path, caption?)` tool (default chat = `ADMIN_USER_ID`).
+- [ ] `telegram_bot/opencode_setup.py` — on startup, best-effort and idempotent:
+      merge `mcp.telegram` into `~/.config/opencode/opencode.json` and write
+      `~/.config/opencode/skills/telegram-media/SKILL.md`; never corrupt an
+      existing config (skip on invalid JSON).
+- [ ] Add `mcp` to `requirements.txt`.
+- [ ] Wire the installer into `bot.post_init`; errors are logged, never fatal.
+- [ ] Tests (no network): config merge/skip, skill write/skip, tool path
+      validation + send via a fake.
+- [ ] Note: opencode loads config/skills once at startup — restart it to pick
+      these up.
+
+### Phase 7 - single launcher (opencode serve + bot) (CURRENT)
+One command starts both the opencode server and the Telegram bot, so the freshly
+installed MCP config/skill are loaded without a separate opencode restart.
+
+- [ ] `telegram_bot/launcher.py` + `telegram_bot/__main__.py`:
+      1. run `opencode_setup.install_all()` BEFORE starting the server;
+      2. detect a running `opencode serve` on the configured port (health check
+         and/or listening socket) and **kill it first** if present;
+      3. start `opencode serve --port <port> --hostname <host>` (port/host parsed
+         from `OPENCODE_BASE_URL`);
+      4. wait until healthy, then run the bot;
+      5. terminate the server we started on exit.
+- [ ] Config: `OPENCODE_SERVE_COMMAND` (default `opencode`); `psutil` added to
+      `requirements.txt` for port/PID detection and killing the process tree.
+- [ ] `python -m telegram_bot` is the single command; `python -m telegram_bot.bot`
+      still works for users who run `opencode serve` themselves.
+- [ ] Tests (no network): URL parse, health/running detection, kill decision,
+      command construction (Windows `.cmd` shim handling), and no-op when nothing
+      is running.
+
 ## Tech Stack
 
 | Concern        | Choice                                                        |

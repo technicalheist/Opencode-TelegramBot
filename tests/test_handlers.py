@@ -84,6 +84,7 @@ class FakeClient:
         self.get_session_todos = AsyncMock(return_value=[])
         self.get_last_activity = AsyncMock(return_value=None)
         self.get_last_assistant_message = AsyncMock(return_value=None)
+        self.get_turn_assistant_parts = AsyncMock(return_value=[])
         self.get_session_diff = AsyncMock(return_value=[])
         self.list_questions = AsyncMock(return_value=[])
         self.reply_question = AsyncMock()
@@ -2284,18 +2285,15 @@ async def test_process_prompt_sends_outbound_media(monkeypatch, tmp_path):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
-    client.get_last_assistant_message = AsyncMock(
-        return_value={
-            "info": {"role": "assistant"},
-            "parts": [
-                {
-                    "type": "file",
-                    "url": _data_url("image/png", b"png"),
-                    "mime": "image/png",
-                    "filename": "pic.png",
-                }
-            ],
-        }
+    client.get_turn_assistant_parts = AsyncMock(
+        return_value=[
+            {
+                "type": "file",
+                "url": _data_url("image/png", b"png"),
+                "mime": "image/png",
+                "filename": "pic.png",
+            }
+        ]
     )
 
     update = _update(text="hi")
@@ -2310,12 +2308,37 @@ async def test_process_prompt_survives_media_delivery_error(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
-    client.get_last_assistant_message = AsyncMock(side_effect=RuntimeError("boom"))
+    client.get_turn_assistant_parts = AsyncMock(side_effect=RuntimeError("boom"))
 
     update = _update(text="hi")
     await handlers.text_message(update, _context(client))
 
     assert "hello from opencode" in update.effective_message.edits
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_sends_patch_media_from_earlier_message(
+    monkeypatch, tmp_path
+):
+    media = tmp_path / "shot.png"
+    media.write_bytes(b"x")
+    db = FakeDB(_row())
+    db.workdirs[111] = str(tmp_path)
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.get_turn_assistant_parts = AsyncMock(
+        return_value=[{"type": "patch", "files": [str(media)]}]
+    )
+
+    update = _update(text="make a screenshot")
+    await handlers.text_message(update, _context(client))
+
+    assert len(update.effective_message.photos) == 1
+
+    second = _update(text="again")
+    await handlers.text_message(second, _context(client))
+
+    assert second.effective_message.photos == []
 
 
 def _question_state(request_id="que_1", questions=None, index=0, directory=None):

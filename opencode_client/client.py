@@ -312,6 +312,52 @@ class OpenCodeClient:
             raise OpenCodeError("Message list response was not a JSON array.")
         return body
 
+    async def get_turn_assistant_parts(
+        self, session_id: str, *, directory: str | Path | None = None
+    ) -> list[dict]:
+        path = f"/session/{session_id}/message"
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path), params=self._params(directory), timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Message list response was not valid JSON.") from exc
+        if not isinstance(body, list):
+            raise OpenCodeError("Message list response was not a JSON array.")
+        last_user_index = -1
+        for index, message in enumerate(body):
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if isinstance(info, dict) and info.get("role") == "user":
+                last_user_index = index
+        if last_user_index < 0:
+            for message in reversed(body):
+                if not isinstance(message, dict):
+                    continue
+                info = message.get("info")
+                if not isinstance(info, dict) or info.get("role") != "assistant":
+                    continue
+                raw_parts = message.get("parts")
+                if isinstance(raw_parts, list) and raw_parts:
+                    return [part for part in raw_parts if isinstance(part, dict)]
+            return []
+        parts: list[dict] = []
+        for message in body[last_user_index + 1 :]:
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info")
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            raw_parts = message.get("parts")
+            if isinstance(raw_parts, list):
+                parts.extend(part for part in raw_parts if isinstance(part, dict))
+        return parts
+
     async def get_last_assistant_message(
         self, session_id: str, *, directory: str | Path | None = None
     ) -> dict | None:

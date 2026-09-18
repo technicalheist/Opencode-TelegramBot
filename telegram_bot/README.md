@@ -37,14 +37,25 @@ Configuration keys:
 
 ## Run
 
+The single launcher starts both the opencode server and the bot:
+
+```powershell
+.venv\Scripts\python -m telegram_bot
+```
+
+It installs the global MCP tool + skill, stops any stale `opencode serve` on the
+configured port, starts a fresh `opencode serve --port … --hostname …`, waits for
+`GET /global/health`, then runs the bot; the server it started is stopped on
+exit. The bot uses long polling, seeds the admin, creates `data/` and `media/`,
+and runs a background SSE listener for permission and question events.
+
+If you run your own opencode server, skip the launcher:
+
 ```powershell
 .venv\Scripts\python -m telegram_bot.bot
 ```
 
-The bot uses long polling, seeds the admin, creates `data/` and `media/`, then
-logs `Bot started`. On startup it also connects to the local opencode server and
-runs a background SSE listener for permission events. `python
-telegram_bot\bot.py` also works via the package's root-path bootstrap.
+`python telegram_bot\bot.py` also works via the package's root-path bootstrap.
 
 ## Commands
 
@@ -116,6 +127,29 @@ streamed size). Filesystem paths are rejected unless contained by the session
 directory. Sends are deduplicated per session via an in-memory
 `SENT_MEDIA: dict[str, set[str]]` so the same file is not sent twice, and all
 media work is wrapped so a failure never breaks the text reply.
+
+## Reliable Telegram send (MCP + skill)
+
+In addition to the pull-based method above, an explicit path is installed
+globally at bot startup so the agent can deliberately send a file:
+
+- `telegram_bot/send_media.py` is both a CLI and a reusable API:
+  `python -m telegram_bot.send_media "<absolute path>" [--caption "..."] [--chat-id ID]`.
+  It enforces `MEDIA_MAX_MB`, posts images as photos (except GIF) and everything
+  else as documents, and defaults the chat to `ADMIN_USER_ID`.
+- `telegram_bot/mcp_server.py` is a local stdio MCP server exposing the
+  `telegram_send_file(path, caption?)` tool. It uses the `mcp` SDK's `FastMCP`
+  when available and otherwise falls back to a dependency-free JSON-RPC stdio
+  server.
+- `telegram_bot/opencode_setup.py` installs both, idempotently, on startup:
+  it merges an `mcp.telegram` entry into `~/.config/opencode/opencode.json`
+  (preserving other keys, skipping invalid JSON) and writes
+  `~/.config/opencode/skills/telegram-media/SKILL.md`, which documents the MCP
+  tool and the CLI fallback.
+
+opencode reads its config and skills once at startup, so **restart opencode**
+after the bot has installed them. The MCP server runs `mcp_server.py` with the
+bot's Python interpreter and never writes the bot token into any file.
 
 ## Permissions
 

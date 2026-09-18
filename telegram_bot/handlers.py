@@ -995,10 +995,9 @@ async def _process_prompt(
             voice_mode=voice_mode,
         )
         try:
-            last_message = await client.get_last_assistant_message(
+            parts = await client.get_turn_assistant_parts(
                 session_id, directory=directory
             )
-            parts = (last_message or {}).get("parts") or []
             try:
                 diff_files = await client.get_session_diff(
                     session_id, directory=directory

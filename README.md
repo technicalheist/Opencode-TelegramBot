@@ -51,7 +51,8 @@ opencode events to surface permission requests.
 ## Prerequisites
 
 - **Python 3.14+**
-- A running **opencode server** (default `http://localhost:4096`)
+- The **opencode** CLI on your `PATH` (the single launcher starts `opencode serve`
+  for you; you can also run your own server)
 - A **Telegram bot token** from [@BotFather](https://t.me/BotFather)
 - An **OpenRouter API key** for STT (only needed for voice input)
 - Your Telegram **numeric user id** (get it from [@userinfobot](https://t.me/userinfobot))
@@ -86,22 +87,40 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 | `STT_PROVIDER` | `api` | Reserved |
 | `TTS_VOICE` | `en-US-AriaNeural` | Edge TTS voice |
 | `TTS_RATE` / `TTS_VOLUME` / `TTS_PITCH` | `+0%` / `+0%` / `+0Hz` | Edge TTS prosody |
-| `OPENCODE_BASE_URL` | `http://localhost:4096` | opencode server URL |
+| `OPENCODE_BASE_URL` | `http://localhost:4096` | opencode server URL (host/port are used to start it) |
 | `OPENCODE_DIRECTORY` | repo root | Default working directory |
 | `OPENCODE_AGENT` | `build` | opencode agent to use |
 | `OPENCODE_TIMEOUT` | `600` | Seconds to wait for a blocking prompt |
+| `OPENCODE_SERVE_COMMAND` | `opencode` | Command used to launch `opencode serve` |
 | `MEDIA_MAX_MB` | `20` | Max size for bridged media |
 
 ## Run
 
-Make sure your opencode server is running, then:
+One command starts everything. `python -m telegram_bot`:
+
+1. installs the global MCP tool + skill (`~/.config/opencode/`) idempotently,
+2. stops any stale `opencode serve` on the configured port,
+3. starts `opencode serve --port … --hostname …`,
+4. waits until the server is healthy, then
+5. runs the Telegram bot (and stops the server it started on exit).
+
+```powershell
+.venv\Scripts\python -m telegram_bot
+```
+
+Because the MCP config and skill are installed before the server starts, the
+freshly started opencode picks them up. The bot logs `Bot started` and begins
+long polling; open your bot in Telegram and send `/start`.
+
+If you prefer to manage your own opencode server, start it yourself and run the
+bot directly:
 
 ```powershell
 .venv\Scripts\python -m telegram_bot.bot
 ```
 
-The bot logs `Bot started` and begins long polling. Open your bot in Telegram and
-send `/start`.
+In that mode, restart opencode after the bot has installed the MCP config/skill
+so it loads them.
 
 ## Commands
 

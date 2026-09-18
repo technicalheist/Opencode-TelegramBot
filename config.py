@@ -85,6 +85,7 @@ OPENCODE_BASE_URL: str = _env("OPENCODE_BASE_URL", "http://localhost:4096")
 OPENCODE_DIRECTORY: Path = _resolve_path(os.getenv("OPENCODE_DIRECTORY"), ".")
 OPENCODE_AGENT: str = _env("OPENCODE_AGENT", "build")
 OPENCODE_TIMEOUT: float = _parse_opencode_timeout()
+OPENCODE_SERVE_COMMAND: str = _env("OPENCODE_SERVE_COMMAND", "opencode")
 MEDIA_MAX_MB: int = _parse_media_max_mb()
 
 
