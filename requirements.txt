@@ -1,4 +1,4 @@
-python-telegram-bot~=22.0
+python-telegram-bot[webhooks]~=22.0
 python-dotenv
 httpx
 edge-tts

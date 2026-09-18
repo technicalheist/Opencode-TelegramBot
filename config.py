@@ -89,6 +89,35 @@ OPENCODE_SERVE_COMMAND: str = _env("OPENCODE_SERVE_COMMAND", "opencode")
 MEDIA_MAX_MB: int = _parse_media_max_mb()
 
 
+def _parse_webhook_port() -> int:
+    raw = _env("TELEGRAM_WEBHOOK_PORT", "8080")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"TELEGRAM_WEBHOOK_PORT must be an integer, got {raw!r}."
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(f"TELEGRAM_WEBHOOK_PORT must be positive, got {raw!r}.")
+    return value
+
+
+TELEGRAM_WEBHOOK_URL: str = _env("TELEGRAM_WEBHOOK_URL")
+TELEGRAM_WEBHOOK_PORT: int = _parse_webhook_port()
+TELEGRAM_WEBHOOK_PATH: str = _env("TELEGRAM_WEBHOOK_PATH")
+TELEGRAM_WEBHOOK_SECRET: str = _env("TELEGRAM_WEBHOOK_SECRET")
+CLOUDFLARED_COMMAND: str = _env("CLOUDFLARED_COMMAND", "cloudflared")
+CLOUDFLARED_TUNNEL_TOKEN: str = _env("CLOUDFLARED_TUNNEL_TOKEN")
+
+
+def webhook_enabled() -> bool:
+    return bool(TELEGRAM_WEBHOOK_URL) and TELEGRAM_WEBHOOK_PORT > 0
+
+
+def cloudflared_enabled() -> bool:
+    return webhook_enabled() and bool(CLOUDFLARED_TUNNEL_TOKEN)
+
+
 def _is_missing(value: str) -> bool:
     return not value or value.lower() in PLACEHOLDER_VALUES or value.startswith("<")
 

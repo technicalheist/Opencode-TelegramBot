@@ -93,6 +93,12 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 | `OPENCODE_TIMEOUT` | `600` | Seconds to wait for a blocking prompt |
 | `OPENCODE_SERVE_COMMAND` | `opencode` | Command used to launch `opencode serve` |
 | `MEDIA_MAX_MB` | `20` | Max size for bridged media |
+| `TELEGRAM_WEBHOOK_URL` | — | Public HTTPS base URL; **empty = long polling** |
+| `TELEGRAM_WEBHOOK_PORT` | `8080` | Local port the webhook server listens on |
+| `TELEGRAM_WEBHOOK_PATH` | — | Secret path segment Telegram posts to |
+| `TELEGRAM_WEBHOOK_SECRET` | — | `X-Telegram-Bot-Api-Secret-Token` value |
+| `CLOUDFLARED_COMMAND` | `cloudflared` | Path to the `cloudflared` binary |
+| `CLOUDFLARED_TUNNEL_TOKEN` | — | Remote-managed tunnel token (launcher runs it) |
 
 ## Run
 
@@ -121,6 +127,28 @@ bot directly:
 
 In that mode, restart opencode after the bot has installed the MCP config/skill
 so it loads them.
+
+## Webhook mode (cloudflared)
+
+By default the bot uses long polling (works offline, no public URL). Setting
+`TELEGRAM_WEBHOOK_URL` switches `python -m telegram_bot` to webhook mode:
+
+- the bot listens on `127.0.0.1:TELEGRAM_WEBHOOK_PORT` at
+  `/<TELEGRAM_WEBHOOK_PATH>` and registers
+  `https://<host>/<TELEGRAM_WEBHOOK_PATH>` with Telegram, using
+  `TELEGRAM_WEBHOOK_SECRET` as the request secret;
+- the launcher starts `cloudflared tunnel --no-autoupdate run --token …` and
+  waits for the public URL to respond (it continues with a warning if the
+  tunnel is not up yet), and stops cloudflared on exit alongside `opencode
+  serve`.
+
+The Cloudflare side here is **remotely-managed**: a tunnel named
+`telegram-bot` with ingress `telegram-bot.shivrajan.com → http://localhost:8080`
+and a proxied CNAME to `<tunnel-id>.cfargotunnel.com`. The token is the only
+secret the launcher needs; set the keys above in `.env`.
+
+To revert to long polling, empty `TELEGRAM_WEBHOOK_URL` (the launcher then skips
+cloudflared and the bot polls).
 
 ## Commands
 

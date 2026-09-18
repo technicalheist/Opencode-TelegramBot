@@ -457,6 +457,43 @@ async def test_stream_events_parses_sse_from_transport(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_stream_events_passes_directory_override(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"id": "e1"}\n\n',
+        )
+
+    oc = _make(handler, tmp_path)
+    events = [event async for event in oc.stream_events(directory="D:/jcp")]
+
+    assert events == [{"id": "e1"}]
+    assert captured["directory"] == str(Path("D:/jcp"))
+
+
+@pytest.mark.asyncio
+async def test_stream_events_uses_default_directory(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"",
+        )
+
+    oc = _make(handler, tmp_path)
+    _ = [event async for event in oc.stream_events()]
+
+    assert captured["directory"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_injected_client_is_not_closed(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"healthy": True})

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import sys
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from telegram.error import BadRequest
 
 from telegram_bot import handlers
 
@@ -2886,3 +2888,164 @@ async def test_present_question_newer_request_replaces_state(monkeypatch):
 
     assert handlers.PENDING_QUESTIONS[111]["request_id"] == "que_2"
     assert bot.send_message.await_count == 2
+
+
+def _html_edits(message):
+    return [
+        call
+        for call in message.edit_text.await_args_list
+        if call.kwargs.get("parse_mode") == "HTML"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_sends_markdown_as_html(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient(reply="**bold**\n\n```python\nprint('x')\n```")
+
+    update = _update(text="hi")
+    await handlers.text_message(update, _context(client))
+
+    html_edits = _html_edits(update.effective_message)
+    assert html_edits
+    sent = html_edits[0].args[0]
+    assert "<b>bold</b>" in sent
+    assert '<pre><code class="language-python">' in sent
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_falls_back_when_html_rejected(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient(reply="**bold**")
+
+    update = _update(text="hi")
+    message = update.effective_message
+    calls: list[tuple] = []
+
+    async def edit(text, **kwargs):
+        calls.append((text, kwargs.get("parse_mode")))
+        if kwargs.get("parse_mode") == "HTML":
+            raise BadRequest("can't parse entities")
+        message.edits.append(text)
+
+    message.edit_text = AsyncMock(side_effect=edit)
+    await handlers.text_message(update, _context(client))
+
+    assert calls[0][1] == "HTML"
+    assert calls[-1] == ("**bold**", None)
+    assert "**bold**" in message.edits
+
+
+@pytest.mark.asyncio
+async def test_voice_mode_synthesizes_plain_text_but_sends_html(monkeypatch):
+    db = FakeDB(_row(), voice=True)
+    monkeypatch.setattr(handlers, "database", db)
+    synthesize = AsyncMock()
+    monkeypatch.setattr(handlers.tts, "synthesize", synthesize)
+    client = FakeClient(reply="**Bold** and `code`")
+
+    update = _update(text="hi")
+    await handlers.text_message(update, _context(client))
+
+    spoken = synthesize.await_args.args[0]
+    assert "<" not in spoken
+    assert "**" not in spoken
+    assert "`" not in spoken
+    assert "Bold" in spoken
+    assert "code" in spoken
+
+    html_edits = _html_edits(update.effective_message)
+    assert html_edits
+    assert "<b>Bold</b>" in html_edits[0].args[0]
+
+
+@pytest.mark.asyncio
+async def test_long_markdown_reply_splits_and_converts_each_chunk(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient(reply="A" + "**bold** " * 700)
+
+    update = _update(text="hi")
+    message = update.effective_message
+    await handlers.text_message(update, _context(client))
+
+    edit_html = _html_edits(message)
+    reply_html = [
+        call
+        for call in message.reply_text.await_args_list
+        if call.kwargs.get("parse_mode") == "HTML"
+    ]
+    assert len(edit_html) == 1
+    assert len(reply_html) == 1
+    assert "<b>bold</b>" in edit_html[0].args[0]
+    assert "<b>bold</b>" in reply_html[0].args[0]
+
+
+def test_request_event_refresh_sets_event():
+    event = asyncio.Event()
+    context = SimpleNamespace(
+        application=SimpleNamespace(bot_data={"refresh_events": event})
+    )
+    handlers.request_event_refresh(context)
+    assert event.is_set()
+
+
+def test_request_event_refresh_noop_when_absent():
+    handlers.request_event_refresh(
+        SimpleNamespace(application=SimpleNamespace(bot_data={}))
+    )
+    handlers.request_event_refresh(SimpleNamespace())
+    handlers.request_event_refresh(SimpleNamespace(application=None))
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_requests_event_refresh(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    event = asyncio.Event()
+    client = FakeClient()
+    context = SimpleNamespace(
+        bot_data={"opencode": client},
+        application=SimpleNamespace(bot_data={"refresh_events": event}),
+    )
+
+    session_id = await handlers.ensure_session(db.row, client, context=context)
+
+    assert session_id == "ses_new"
+    assert event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_apply_workdir_requests_event_refresh(monkeypatch, tmp_path):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    event = asyncio.Event()
+    client = FakeClient()
+    context = SimpleNamespace(
+        bot_data={"opencode": client},
+        application=SimpleNamespace(bot_data={"refresh_events": event}),
+    )
+
+    error = await handlers._apply_workdir(context, db.row, str(tmp_path))
+
+    assert error is None
+    assert event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_new_command_requests_event_refresh(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    event = asyncio.Event()
+    context = SimpleNamespace(
+        bot_data={"opencode": FakeClient()},
+        bot=AsyncMock(),
+        application=SimpleNamespace(bot_data={"refresh_events": event}),
+    )
+
+    update = _update()
+    await handlers.new_command(update, context)
+
+    assert event.is_set()

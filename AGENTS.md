@@ -205,6 +205,59 @@ installed MCP config/skill are loaded without a separate opencode restart.
       command construction (Windows `.cmd` shim handling), and no-op when nothing
       is running.
 
+### Phase 8 - rich text formatting (CURRENT)
+opencode replies are markdown but the bot sent them as plain text. Convert to
+Telegram's HTML mode, and keep TTS on clean plain text.
+
+- [ ] `markdown_to_telegram_html(text)` — escape `&<>`, then map bold/italic/
+      strike/headings/links/bullets/blockquotes and `` `inline` `` /
+      ```` ```fenced``` ```` (with `class="language-*"`) to Telegram HTML tags.
+- [ ] `markdown_to_plain(text)` — strip the markdown syntax for TTS so no tags
+      or `*`/`` ` `` markers are spoken.
+- [ ] Replies are sent with `parse_mode="HTML"`; on a Telegram `BadRequest`
+      (entity parse error) the same chunk is re-sent as plain text.
+- [ ] Split into ≤4096-char chunks BEFORE conversion so each chunk has balanced
+      tags.
+- [ ] Voice mode synthesizes from `markdown_to_plain(text)` — never the HTML.
+- [ ] Tests (no network): converter cases, escaping, code blocks, split, and the
+      plain-text fallback; TTS receives stripped text.
+
+### Phase 9 - per-directory event subscriptions (CURRENT)
+`GET /event` is **directory-scoped**: a stream subscribed with the repo directory
+never receives events for sessions in other workdirs, so questions/permissions
+raised in the user's actual workdir were missed. Verified live.
+
+- [ ] `opencode_client.stream_events(*, directory=None)` — pass a per-call
+      directory.
+- [ ] Replace the single SSE task with a supervisor that keeps one listener per
+      distinct stored session directory (plus `OPENCODE_DIRECTORY`), starting and
+      stopping listeners as sessions change.
+- [ ] Expose a refresh signal so a new session/`/workdir` subscribes immediately
+      (set it in `ensure_session`, `_apply_workdir`, `/new`).
+- [ ] Keep the startup question reconciliation as a safety net.
+- [ ] Tests (no network) for the directory set, task reconcile, and the
+      `stream_events` directory param.
+
+### Phase 10 - webhook mode via cloudflared (CURRENT)
+Long polling works offline; add an optional webhook mode fronted by a Cloudflare
+tunnel so Telegram pushes updates to `telegram-bot.shivrajan.com`.
+
+- [ ] Config: `TELEGRAM_WEBHOOK_URL` (empty → polling), `TELEGRAM_WEBHOOK_PORT`
+      (default 8080), `TELEGRAM_WEBHOOK_PATH`, `TELEGRAM_WEBHOOK_SECRET`,
+      `CLOUDFLARED_COMMAND` (default `cloudflared`), `CLOUDFLARED_TUNNEL_TOKEN`.
+- [ ] `bot.main()` uses `run_webhook(listen=127.0.0.1, port, url_path=<path>,
+      webhook_url=<url>/<path>, secret_token=<secret>)` when the URL is set,
+      otherwise `run_polling()`.
+- [ ] `launcher.main()` starts `cloudflared tunnel run --token <token>` (only in
+      webhook mode), waits until the public URL responds, runs the bot, and
+      terminates cloudflared on exit alongside `opencode serve`.
+- [ ] Tunnel is remotely-managed (`config_src=cloudflare`); ingress
+      `telegram-bot.shivrajan.com → http://localhost:<port>` is set via the
+      Cloudflare API.
+- [ ] Tests (no network): config parsing, mode selection, cloudflared command
+      construction, and skip-when-not-configured.
+- [ ] Docs: README webhook section + the `.env` keys.
+
 ## Tech Stack
 
 | Concern        | Choice                                                        |

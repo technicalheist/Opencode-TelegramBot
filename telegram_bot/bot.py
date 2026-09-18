@@ -28,6 +28,7 @@ from telegram_bot import database, handlers, opencode_setup, storage
 logger = logging.getLogger(__name__)
 
 EVENT_RETRY_DELAY = 5.0
+EVENT_DIR_REFRESH_INTERVAL = 10.0
 
 BOT_COMMANDS = [
     BotCommand("start", "Start the bot"),
@@ -59,11 +60,11 @@ MEDIA_FILTER = (
 )
 
 
-async def _listen_events(application: Application) -> None:
+async def _listen_events(application: Application, directory: str) -> None:
     client = application.bot_data["opencode"]
     while True:
         try:
-            async for event in client.stream_events():
+            async for event in client.stream_events(directory=directory):
                 await handlers.handle_event(
                     event, bot=application.bot, client=client
                 )
@@ -71,10 +72,65 @@ async def _listen_events(application: Application) -> None:
             raise
         except Exception:
             logger.exception(
-                "opencode event stream error; reconnecting in %ss",
+                "opencode event stream error for %s; reconnecting in %ss",
+                directory,
                 EVENT_RETRY_DELAY,
             )
         await asyncio.sleep(EVENT_RETRY_DELAY)
+
+
+def desired_event_directories() -> set[str]:
+    directories = {str(config.OPENCODE_DIRECTORY)}
+    try:
+        rows = database.list_opencode_sessions()
+    except Exception:
+        logger.exception("Could not list sessions for event subscriptions")
+        return directories
+    for row in rows:
+        if not bool(row["is_authenticated"]):
+            continue
+        directory = row["directory"]
+        if directory:
+            directories.add(str(directory))
+    return directories
+
+
+def reconcile_event_tasks(application: Application, directories: set[str]) -> None:
+    tasks: dict[str, asyncio.Task] = application.bot_data.setdefault(
+        "event_tasks", {}
+    )
+    wanted = set(directories)
+    for directory in list(tasks):
+        if directory not in wanted:
+            task = tasks.pop(directory)
+            task.cancel()
+    for directory in wanted:
+        existing = tasks.get(directory)
+        if existing is not None and not existing.done():
+            continue
+        tasks[directory] = application.create_task(
+            _listen_events(application, directory), name=f"events:{directory}"
+        )
+
+
+async def _supervise_events(application: Application) -> None:
+    while True:
+        try:
+            reconcile_event_tasks(application, desired_event_directories())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Event supervisor iteration failed")
+        refresh: asyncio.Event = application.bot_data["refresh_events"]
+        try:
+            await asyncio.wait_for(
+                refresh.wait(), timeout=EVENT_DIR_REFRESH_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        refresh.clear()
 
 
 async def post_init(application: Application) -> None:
@@ -88,8 +144,10 @@ async def post_init(application: Application) -> None:
         logger.exception("opencode setup install failed")
     application.bot_data["opencode"] = OpenCodeClient()
     application.bot_data["user_locks"] = handlers.USER_LOCKS
-    application.bot_data["sse_task"] = application.create_task(
-        _listen_events(application), name="opencode-sse-listener"
+    application.bot_data["refresh_events"] = asyncio.Event()
+    application.bot_data["event_tasks"] = {}
+    application.bot_data["sse_supervisor"] = application.create_task(
+        _supervise_events(application), name="opencode-event-supervisor"
     )
     application.bot_data["reconcile_task"] = application.create_task(
         handlers.reconcile_questions(application),
@@ -101,7 +159,7 @@ async def post_init(application: Application) -> None:
 
 async def post_shutdown(application: Application) -> None:
     for key, label in (
-        ("sse_task", "event listener"),
+        ("sse_supervisor", "event supervisor"),
         ("reconcile_task", "question reconciler"),
     ):
         task = application.bot_data.pop(key, None)
@@ -114,6 +172,18 @@ async def post_shutdown(application: Application) -> None:
             pass
         except Exception:
             logger.exception("Error while stopping the %s", label)
+    event_tasks = application.bot_data.pop("event_tasks", {}) or {}
+    for task in event_tasks.values():
+        task.cancel()
+    for directory, task in event_tasks.items():
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Error while stopping event listener for %s", directory
+            )
     client = application.bot_data.pop("opencode", None)
     if client is not None:
         try:
@@ -192,13 +262,30 @@ def build_application() -> Application:
     return application
 
 
+def _webhook_url() -> str:
+    base = config.TELEGRAM_WEBHOOK_URL.rstrip("/")
+    path = config.TELEGRAM_WEBHOOK_PATH.strip("/")
+    return f"{base}/{path}" if path else base
+
+
 def main() -> None:
     logging.basicConfig(
         level=getattr(logging, config.LOG_LEVEL, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     application = build_application()
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    if config.webhook_enabled():
+        application.run_webhook(
+            listen="127.0.0.1",
+            port=config.TELEGRAM_WEBHOOK_PORT,
+            url_path=config.TELEGRAM_WEBHOOK_PATH.strip("/"),
+            webhook_url=_webhook_url(),
+            secret_token=config.TELEGRAM_WEBHOOK_SECRET or None,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    else:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":

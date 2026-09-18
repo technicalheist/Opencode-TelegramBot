@@ -735,14 +735,16 @@ class OpenCodeClient:
         if trailing is not None:
             yield trailing
 
-    async def stream_events(self) -> AsyncIterator[dict]:
+    async def stream_events(
+        self, *, directory: str | Path | None = None
+    ) -> AsyncIterator[dict]:
         path = "/event"
         headers = {"Accept": "text/event-stream"}
         async with self._http() as client:
             async with client.stream(
                 "GET",
                 self._url(path),
-                params=self._params(),
+                params=self._params(directory),
                 headers=headers,
                 timeout=None,
             ) as response:

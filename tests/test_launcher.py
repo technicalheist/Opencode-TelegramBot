@@ -159,6 +159,7 @@ def test_terminate_pid_tree_uses_psutil(monkeypatch):
 
 
 def _main_env(monkeypatch, calls, *, health=True, bot_raises=False):
+    monkeypatch.setattr(launcher.config, "CLOUDFLARED_TUNNEL_TOKEN", "")
     monkeypatch.setattr(launcher, "parse_base_url", lambda url: ("127.0.0.1", 4096))
     monkeypatch.setattr(
         launcher.opencode_setup,
@@ -216,3 +217,126 @@ def test_main_failed_health_returns_one_and_terminates(monkeypatch):
     assert launcher.main() == 1
     assert "bot" not in calls
     assert "terminate" in calls
+
+
+def _enable_webhook(monkeypatch, token="tok"):
+    monkeypatch.setattr(
+        launcher.config, "TELEGRAM_WEBHOOK_URL", "https://t.example"
+    )
+    monkeypatch.setattr(launcher.config, "TELEGRAM_WEBHOOK_PORT", 8080)
+    monkeypatch.setattr(launcher.config, "CLOUDFLARED_TUNNEL_TOKEN", token)
+
+
+def test_build_cloudflared_command_disabled(monkeypatch):
+    monkeypatch.setattr(launcher.config, "TELEGRAM_WEBHOOK_URL", "")
+    assert launcher.build_cloudflared_command() is None
+
+
+def test_build_cloudflared_command_enabled(monkeypatch):
+    _enable_webhook(monkeypatch)
+    monkeypatch.setattr(
+        launcher.shutil, "which", lambda command: r"C:\cf\cloudflared.exe"
+    )
+
+    command = launcher.build_cloudflared_command()
+
+    assert command == [
+        r"C:\cf\cloudflared.exe",
+        "tunnel",
+        "--no-autoupdate",
+        "run",
+        "--token",
+        "tok",
+    ]
+
+
+def test_build_cloudflared_command_cmd_shim(monkeypatch):
+    _enable_webhook(monkeypatch)
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    monkeypatch.setattr(
+        launcher.shutil, "which", lambda command: r"C:\cf\cloudflared.cmd"
+    )
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    command = launcher.build_cloudflared_command()
+
+    assert command[:3] == [
+        r"C:\Windows\System32\cmd.exe",
+        "/c",
+        r"C:\cf\cloudflared.cmd",
+    ]
+    assert command[-2:] == ["--token", "tok"]
+
+
+def test_wait_for_tunnel_treats_any_response_as_reachable(monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(
+        launcher.httpx,
+        "get",
+        lambda url, timeout=None: seen.append(url)
+        or SimpleNamespace(status_code=404),
+    )
+
+    assert launcher.wait_for_tunnel(
+        "https://t.example", "ocw", timeout=5.0, interval=0
+    ) is True
+    assert seen == ["https://t.example/ocw"]
+
+
+def test_wait_for_tunnel_returns_false_on_timeout(monkeypatch):
+    def boom(url, timeout=None):
+        raise httpx.ConnectError("no")
+
+    monkeypatch.setattr(launcher.httpx, "get", boom)
+
+    assert launcher.wait_for_tunnel(
+        "https://t.example", "ocw", timeout=0.05, interval=0
+    ) is False
+
+
+def test_main_starts_cloudflared_in_webhook_mode(monkeypatch):
+    calls: list[str] = []
+    _main_env(monkeypatch, calls)
+    _enable_webhook(monkeypatch)
+    monkeypatch.setattr(
+        launcher,
+        "build_cloudflared_command",
+        lambda: calls.append("cf-build") or ["cloudflared", "tunnel"],
+    )
+    monkeypatch.setattr(
+        launcher,
+        "start_cloudflared",
+        lambda command: calls.append("cf-start")
+        or SimpleNamespace(pid=2, poll=lambda: None),
+    )
+    monkeypatch.setattr(
+        launcher, "wait_for_tunnel", lambda base, path, **kw: calls.append("tunnel")
+        or True
+    )
+
+    assert launcher.main() == 0
+    assert calls[:7] == [
+        "install",
+        "stop",
+        "start",
+        "wait",
+        "cf-build",
+        "cf-start",
+        "tunnel",
+    ]
+    assert calls[7] == "bot"
+    assert calls.count("terminate") == 2
+
+
+def test_main_skips_cloudflared_when_disabled(monkeypatch):
+    calls: list[str] = []
+    _main_env(monkeypatch, calls)
+    monkeypatch.setattr(launcher.config, "TELEGRAM_WEBHOOK_URL", "")
+    started: list = []
+    monkeypatch.setattr(
+        launcher, "start_cloudflared", lambda command: started.append(command)
+    )
+
+    assert launcher.main() == 0
+    assert started == []
+    assert calls.count("terminate") == 1

@@ -57,6 +57,15 @@ If you run your own opencode server, skip the launcher:
 
 `python telegram_bot\bot.py` also works via the package's root-path bootstrap.
 
+### Webhook mode
+
+With `TELEGRAM_WEBHOOK_URL` set, the bot runs `run_webhook` instead of polling:
+it listens on `127.0.0.1:TELEGRAM_WEBHOOK_PORT/<TELEGRAM_WEBHOOK_PATH>` and
+registers `https://<host>/<TELEGRAM_WEBHOOK_PATH>` with Telegram (secret
+`TELEGRAM_WEBHOOK_SECRET`). The launcher starts and stops a remotely-managed
+cloudflared tunnel (`CLOUDFLARED_COMMAND`, `CLOUDFLARED_TUNNEL_TOKEN`) for the
+public HTTPS URL. Empty `TELEGRAM_WEBHOOK_URL` keeps long polling.
+
 ## Commands
 
 - `/start`, `/help` - welcome and command list.
@@ -151,14 +160,33 @@ opencode reads its config and skills once at startup, so **restart opencode**
 after the bot has installed them. The MCP server runs `mcp_server.py` with the
 bot's Python interpreter and never writes the bot token into any file.
 
+## Rich text replies (Phase 8)
+
+opencode replies are markdown; the bot converts them to Telegram HTML
+(`parse_mode="HTML"`) so bold, italic, strike, headings, links, blockquotes,
+lists, inline code, and fenced code blocks render properly. Text is HTML-escaped
+first, so raw `<`/`>`/`&` can never inject tags. Replies are split into
+≤4096-char chunks before conversion; if Telegram rejects the entities
+(`BadRequest`), the same chunk is re-sent as plain text. Voice mode synthesizes
+from `markdown_to_plain(reply_text)` (markers and tags stripped), never from the
+HTML, while the accompanying text message uses the HTML version.
+
 ## Permissions
 
-A background listener consumes `GET /event` (SSE). When opencode asks for
-permission (`permission.asked`), the bot sends an inline keyboard with **Allow
-once**, **Always**, and **Reject**. Tapping a button calls
+A background supervisor keeps one SSE listener per distinct session working
+directory: `GET /event?directory=<dir>` is directory-scoped, so events for a
+session in `D:\Projects\jcp` only arrive on a stream subscribed with that
+directory. The supervisor reconciles the set of listeners from
+`config.OPENCODE_DIRECTORY` plus every authenticated session's directory
+(re-checked every ~10s and immediately when a session/workdir changes), starting
+and cancelling listeners as needed.
+
+When opencode asks for permission (`permission.asked`), the bot sends an inline
+keyboard with **Allow once**, **Always**, and **Reject**. Tapping a button calls
 `POST /permission/{requestID}/reply` and resumes the agent; the original message
-is edited to show the decision. Prompts are serialized per Telegram user with an
-`asyncio.Lock`.
+is edited to show the decision. Questions (`question.asked`) are likewise
+surfaced from whichever directory's stream carries them. Prompts are serialized
+per Telegram user with an `asyncio.Lock`.
 
 ## Question prompts (Phase 5)
 

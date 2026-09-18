@@ -213,6 +213,54 @@ def wait_for_health(
     return False
 
 
+def build_cloudflared_command() -> Optional[list[str]]:
+    if not config.cloudflared_enabled():
+        return None
+    resolved = shutil.which(config.CLOUDFLARED_COMMAND)
+    if resolved is None and os.path.isfile(config.CLOUDFLARED_COMMAND):
+        resolved = config.CLOUDFLARED_COMMAND
+    if resolved is None:
+        raise RuntimeError(
+            f"Could not find cloudflared command: {config.CLOUDFLARED_COMMAND!r}"
+        )
+    tunnel_args = [
+        "tunnel",
+        "--no-autoupdate",
+        "run",
+        "--token",
+        config.CLOUDFLARED_TUNNEL_TOKEN,
+    ]
+    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
+        shell = os.environ.get("COMSPEC", "cmd.exe")
+        return [shell, "/c", resolved, *tunnel_args]
+    return [resolved, *tunnel_args]
+
+
+def start_cloudflared(command: list[str]) -> subprocess.Popen:
+    return start_server(command)
+
+
+def wait_for_tunnel(
+    base_url: str,
+    path: str,
+    *,
+    timeout: float = 60.0,
+    interval: float = 2.0,
+) -> bool:
+    base = (base_url or "").rstrip("/")
+    clean_path = (path or "").strip("/")
+    url = f"{base}/{clean_path}" if clean_path else base
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            httpx.get(url, timeout=5.0)
+            return True
+        except Exception:
+            time.sleep(interval)
+    logger.warning("Tunnel did not respond at %s within %ss", url, timeout)
+    return False
+
+
 def terminate_server(process: subprocess.Popen, port: int) -> None:
     try:
         if process.poll() is not None:
@@ -242,6 +290,7 @@ def main() -> int:
     except Exception:
         logger.exception("opencode setup install failed")
     process: Optional[subprocess.Popen] = None
+    cloudflared_process: Optional[subprocess.Popen] = None
     try:
         stop_existing_server(base_url, port)
         command = build_serve_command(host, port)
@@ -253,12 +302,29 @@ def main() -> int:
             process = None
             return 1
         logger.info("opencode server healthy at %s", base_url)
+        if config.cloudflared_enabled():
+            try:
+                cloudflared_command = build_cloudflared_command()
+            except Exception:
+                logger.exception("Could not build cloudflared command")
+                cloudflared_command = None
+            if cloudflared_command is not None:
+                logger.info("Starting cloudflared tunnel")
+                cloudflared_process = start_cloudflared(cloudflared_command)
+                if not wait_for_tunnel(
+                    config.TELEGRAM_WEBHOOK_URL, config.TELEGRAM_WEBHOOK_PATH
+                ):
+                    logger.warning(
+                        "cloudflared tunnel not reachable yet; continuing anyway"
+                    )
         bot.main()
         return 0
     except Exception:
         logger.exception("Launcher failed")
         return 1
     finally:
+        if cloudflared_process is not None:
+            terminate_server(cloudflared_process, 0)
         if process is not None:
             terminate_server(process, port)
 

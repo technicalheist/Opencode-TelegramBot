@@ -16,6 +16,7 @@ from typing import Optional
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 import config
@@ -23,6 +24,7 @@ import stt
 import tts
 from opencode_client import OpenCodeError, PermissionRequest
 from telegram_bot import database, storage
+from telegram_bot.formatting import markdown_to_plain, markdown_to_telegram_html
 
 logger = logging.getLogger(__name__)
 
@@ -641,6 +643,18 @@ def _client(context: ContextTypes.DEFAULT_TYPE):
     return context.bot_data["opencode"]
 
 
+def request_event_refresh(context) -> None:
+    application = getattr(context, "application", None)
+    if application is None:
+        return
+    bot_data = getattr(application, "bot_data", None)
+    if not bot_data:
+        return
+    event = bot_data.get("refresh_events")
+    if event is not None:
+        event.set()
+
+
 def _ensure_user_row(update: Update) -> sqlite3.Row:
     telegram_user = update.effective_user
     assert telegram_user is not None
@@ -671,6 +685,7 @@ async def ensure_session(
     *,
     directory: Optional[str] = None,
     model: Optional[dict] = None,
+    context=None,
 ) -> str:
     existing = database.get_opencode_session(int(user_row["id"]))
     if existing is not None:
@@ -690,6 +705,8 @@ async def ensure_session(
     database.set_opencode_session(
         int(user_row["id"]), str(session_id), target_directory
     )
+    if context is not None:
+        request_event_refresh(context)
     return str(session_id)
 
 
@@ -721,6 +738,20 @@ async def _send_voice_reply(message, text: str, telegram_id: int) -> None:
             pass
 
 
+async def _send_rich_text(send, chunk: str) -> None:
+    html = markdown_to_telegram_html(chunk)
+    if html and html != chunk:
+        try:
+            await send(html, parse_mode="HTML")
+            return
+        except BadRequest:
+            logger.warning(
+                "Telegram rejected HTML entities; falling back to plain text",
+                exc_info=True,
+            )
+    await send(chunk)
+
+
 async def _deliver_reply(
     message,
     placeholder,
@@ -733,11 +764,13 @@ async def _deliver_reply(
     if not chunks:
         await placeholder.edit_text(EMPTY_REPLY_TEXT)
         return
-    await placeholder.edit_text(chunks[0])
+    await _send_rich_text(placeholder.edit_text, chunks[0])
     for chunk in chunks[1:]:
-        await message.reply_text(chunk)
+        await _send_rich_text(message.reply_text, chunk)
     if voice_mode:
-        await _send_voice_reply(message, reply_text, telegram_id)
+        await _send_voice_reply(
+            message, markdown_to_plain(reply_text), telegram_id
+        )
 
 
 def _is_media_filename(name: str) -> bool:
@@ -962,7 +995,11 @@ async def _process_prompt(
         placeholder = None
         try:
             session_id = await ensure_session(
-                user_row, client, directory=directory, model=model
+                user_row,
+                client,
+                directory=directory,
+                model=model,
+                context=context,
             )
             placeholder = await message.reply_text(WORKING_TEXT)
             mark_task_started(telegram_id, session_id, prompt)
@@ -1128,6 +1165,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if row is None:
         return
     database.delete_opencode_session(int(row["id"]))
+    request_event_refresh(context)
     await update.effective_message.reply_text(SESSION_RESET_TEXT)
 
 
@@ -1319,6 +1357,7 @@ async def _apply_workdir(
     if not session_id:
         return OPENCODE_ERROR_TEXT
     database.set_opencode_session(user_id, str(session_id), directory)
+    request_event_refresh(context)
     return None
 
 
