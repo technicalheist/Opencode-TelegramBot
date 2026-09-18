@@ -317,6 +317,56 @@ async def test_reject_question_raises_on_error(tmp_path):
         await oc.reject_question("que_1")
 
 
+@pytest.mark.asyncio
+async def test_reply_question_sends_directory_override(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["directory"] = request.url.params.get("directory")
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    oc = _make(handler, tmp_path)
+    await oc.reply_question("que_1", [["Purple"]], directory="D:/x")
+
+    assert captured["path"] == "/question/que_1/reply"
+    assert captured["directory"] == str(Path("D:/x"))
+    assert captured["body"] == {"answers": [["Purple"]]}
+
+
+@pytest.mark.asyncio
+async def test_reject_question_sends_directory_override(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(200, json={})
+
+    oc = _make(handler, tmp_path)
+    await oc.reject_question("que_1", directory="D:/x")
+
+    assert captured["path"] == "/question/que_1/reject"
+    assert captured["directory"] == str(Path("D:/x"))
+
+
+@pytest.mark.asyncio
+async def test_reply_reject_question_use_default_directory_when_omitted(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(200, json={})
+
+    oc = _make(handler, tmp_path)
+    await oc.reply_question("que_1", ["a"])
+    assert captured["directory"] == str(tmp_path)
+
+    await oc.reject_question("que_1")
+    assert captured["directory"] == str(tmp_path)
+
+
 def test_parse_sse_lines_handles_comments_keepalives_and_multiline():
     lines = [
         ": keepalive",

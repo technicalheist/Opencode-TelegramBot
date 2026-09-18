@@ -648,24 +648,32 @@ class OpenCodeClient:
             raise OpenCodeError("Question list response was not a JSON array.")
         return body
 
-    async def reply_question(self, request_id: str, answers: list) -> None:
+    async def reply_question(
+        self,
+        request_id: str,
+        answers: list,
+        *,
+        directory: str | Path | None = None,
+    ) -> None:
         path = f"/question/{request_id}/reply"
         async with self._http() as client:
             response = await client.post(
                 self._url(path),
-                params=self._params(),
+                params=self._params(directory),
                 json={"answers": answers},
                 timeout=self._timeout,
             )
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
 
-    async def reject_question(self, request_id: str) -> None:
+    async def reject_question(
+        self, request_id: str, *, directory: str | Path | None = None
+    ) -> None:
         path = f"/question/{request_id}/reject"
         async with self._http() as client:
             response = await client.post(
                 self._url(path),
-                params=self._params(),
+                params=self._params(directory),
                 timeout=self._timeout,
             )
         if response.status_code >= 400:

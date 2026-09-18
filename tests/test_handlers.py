@@ -2318,10 +2318,11 @@ async def test_process_prompt_survives_media_delivery_error(monkeypatch):
     assert "hello from opencode" in update.effective_message.edits
 
 
-def _question_state(request_id="que_1", questions=None, index=0):
+def _question_state(request_id="que_1", questions=None, index=0, directory=None):
     return {
         "request_id": request_id,
         "session_id": "ses_1",
+        "directory": directory,
         "questions": questions
         or [
             {
@@ -2357,7 +2358,7 @@ def test_build_question_keyboard_single_select():
     assert "q:a:0:1" in data
     assert "q:r" in data
     assert "q:d:0" not in data
-    assert "q:x:0" not in data
+    assert "q:x:0" in data
     assert all(len(item.encode("utf-8")) <= 64 for item in data)
 
 
@@ -2643,6 +2644,7 @@ async def test_reconcile_questions_surfaces_pending(monkeypatch):
 
     client.list_questions.assert_awaited_once_with(directory="D:/x")
     assert 111 in handlers.PENDING_QUESTIONS
+    assert handlers.PENDING_QUESTIONS[111]["directory"] == "D:/x"
     bot.send_message.assert_awaited_once()
 
 
@@ -2689,3 +2691,175 @@ async def test_reconcile_questions_skips_unauthenticated(monkeypatch):
     await handlers.reconcile_questions(application)
 
     client.list_questions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_text_while_question_pending_is_consumed_as_custom_answer(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    context = _context(client)
+
+    update = _update(text="typed instead of tapping")
+    await handlers.text_message(update, context)
+
+    client.reply_question.assert_awaited_once_with(
+        "que_1", [["typed instead of tapping"]]
+    )
+    client.send_prompt.assert_not_awaited()
+    client.create_session.assert_not_awaited()
+    assert 111 not in handlers.PENDING_QUESTIONS
+
+
+@pytest.mark.asyncio
+async def test_text_while_awaiting_text_is_consumed(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    state = _question_state(
+        questions=[{"question": "Name?", "options": [], "custom": True}]
+    )
+    state["awaiting_text"] = True
+    handlers.PENDING_QUESTIONS[111] = state
+
+    update = _update(text="my typed answer")
+    await handlers.text_message(update, _context(client))
+
+    client.reply_question.assert_awaited_once_with("que_1", [["my typed answer"]])
+    client.send_prompt.assert_not_awaited()
+    assert 111 not in handlers.PENDING_QUESTIONS
+
+
+@pytest.mark.asyncio
+async def test_text_while_custom_question_pending_is_consumed(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state(
+        questions=[{"question": "Name?", "options": [], "custom": True}]
+    )
+
+    update = _update(text="custom answer")
+    await handlers.text_message(update, _context(client))
+
+    client.reply_question.assert_awaited_once_with("que_1", [["custom answer"]])
+    client.send_prompt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_status_command_with_pending_question(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    context = _context(client)
+
+    update = _update()
+    await handlers.status_command(update, context)
+
+    combined = "\n".join(update.effective_message.sent)
+    assert "❓ Waiting for your answer: Confirm" in combined
+    context.bot.send_message.assert_awaited()
+    client.get_session_status.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_present_question_same_request_edits_not_resends(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=3)),
+        edit_message_text=AsyncMock(),
+    )
+    request = {
+        "id": "que_1",
+        "sessionID": "ses_1",
+        "questions": [{"question": "Q?", "options": [{"label": "A"}]}],
+    }
+
+    await handlers.present_question(bot, db.row, request)
+    await handlers.present_question(bot, db.row, request)
+
+    assert bot.send_message.await_count == 1
+    bot.edit_message_text.assert_awaited_once()
+    assert handlers.PENDING_QUESTIONS[111]["request_id"] == "que_1"
+
+
+@pytest.mark.asyncio
+async def test_present_question_stores_directory(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=3)),
+        edit_message_text=AsyncMock(),
+    )
+    request = {
+        "id": "que_1",
+        "sessionID": "ses_1",
+        "questions": [{"question": "Q?", "options": [{"label": "A"}]}],
+    }
+
+    await handlers.present_question(bot, db.row, request, directory="D:/jcp")
+
+    assert handlers.PENDING_QUESTIONS[111]["directory"] == "D:/jcp"
+
+
+@pytest.mark.asyncio
+async def test_question_callback_answer_passes_directory(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state(directory="D:/jcp")
+    query = FakeQuery("q:a:0:0", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, _context(client))
+
+    client.reply_question.assert_awaited_once_with(
+        "que_1", [["Yes"]], directory="D:/jcp"
+    )
+
+
+@pytest.mark.asyncio
+async def test_question_callback_skip_passes_directory(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state(directory="D:/jcp")
+    query = FakeQuery("q:r", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, _context(client))
+
+    client.reject_question.assert_awaited_once_with("que_1", directory="D:/jcp")
+
+
+@pytest.mark.asyncio
+async def test_present_question_newer_request_replaces_state(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=3)),
+        edit_message_text=AsyncMock(),
+    )
+    first = {
+        "id": "que_1",
+        "sessionID": "ses_1",
+        "questions": [{"question": "First?", "options": [{"label": "A"}]}],
+    }
+    second = {
+        "id": "que_2",
+        "sessionID": "ses_1",
+        "questions": [{"question": "Second?", "options": [{"label": "B"}]}],
+    }
+
+    await handlers.present_question(bot, db.row, first)
+    await handlers.present_question(bot, db.row, second)
+
+    assert handlers.PENDING_QUESTIONS[111]["request_id"] == "que_2"
+    assert bot.send_message.await_count == 2

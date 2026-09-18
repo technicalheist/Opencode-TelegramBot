@@ -501,12 +501,10 @@ def build_question_keyboard(
     footer: list[InlineKeyboardButton] = []
     if multiple:
         footer.append(InlineKeyboardButton("✅ Done", callback_data=f"q:d:{qidx}"))
-    if custom:
-        footer.append(
-            InlineKeyboardButton("✏️ Type answer", callback_data=f"q:x:{qidx}")
-        )
-    if footer:
-        rows.append(footer)
+    footer.append(
+        InlineKeyboardButton("✏️ Type answer", callback_data=f"q:x:{qidx}")
+    )
+    rows.append(footer)
     rows.append([InlineKeyboardButton("🚫 Skip", callback_data="q:r")])
     return InlineKeyboardMarkup(rows)
 
@@ -526,7 +524,17 @@ def _question_text(state: dict) -> str:
         lines.append(body)
     if question.get("multiple"):
         lines.append("Select one or more options, then tap ✅ Done.")
+    else:
+        lines.append("Tap an option, or type your own answer.")
     return "\n".join(lines)
+
+
+def _current_question(state: dict) -> dict:
+    questions = state.get("questions") or []
+    index = int(state.get("index") or 0)
+    if 0 <= index < len(questions) and isinstance(questions[index], dict):
+        return questions[index]
+    return {}
 
 
 def model_payload(telegram_id: int) -> Optional[dict]:
@@ -1214,6 +1222,22 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if row is None:
         return
     message = update.effective_message
+    telegram_id = int(row["telegram_id"])
+    state = PENDING_QUESTIONS.get(telegram_id)
+    if state is not None:
+        question = _current_question(state)
+        header = str(question.get("header") or question.get("question") or "").strip()
+        note = (
+            f"❓ Waiting for your answer: {header}"
+            if header
+            else "❓ Waiting for your answer."
+        )
+        try:
+            await _show_current_question(context.bot, telegram_id)
+        except Exception:
+            logger.exception("Could not resend pending question for %s", telegram_id)
+        await message.reply_text(note)
+        return
     try:
         text = await _build_status_text(context, row)
     except OpenCodeError:
@@ -1815,14 +1839,23 @@ async def _show_current_question(bot, telegram_id: int, *, edit: bool = False) -
         logger.exception("Could not send question message")
 
 
-async def present_question(bot, user_row, request) -> None:
+async def present_question(bot, user_row, request, *, directory=None) -> None:
     questions = request.get("questions") if isinstance(request, dict) else None
     if not questions:
         return
     telegram_id = int(user_row["telegram_id"])
+    request_id = str(request.get("id") or "")
+    existing = PENDING_QUESTIONS.get(telegram_id)
+    if existing is not None and str(existing.get("request_id")) == request_id:
+        existing["questions"] = list(questions)
+        if directory:
+            existing["directory"] = directory
+        await _show_current_question(bot, telegram_id, edit=True)
+        return
     PENDING_QUESTIONS[telegram_id] = {
-        "request_id": str(request.get("id") or ""),
+        "request_id": request_id,
         "session_id": str(request.get("sessionID") or ""),
+        "directory": directory,
         "questions": list(questions),
         "index": 0,
         "answers": [],
@@ -1845,8 +1878,14 @@ async def _record_answer(
         await _show_current_question(context.bot, telegram_id, edit=True)
         return
     client = _client(context)
+    directory = state.get("directory") or None
     try:
-        await client.reply_question(state["request_id"], state["answers"])
+        if directory:
+            await client.reply_question(
+                state["request_id"], state["answers"], directory=directory
+            )
+        else:
+            await client.reply_question(state["request_id"], state["answers"])
     except Exception:
         logger.exception("Failed to reply to question %s", state.get("request_id"))
         PENDING_QUESTIONS.pop(telegram_id, None)
@@ -1881,8 +1920,14 @@ async def question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     action, qidx, oidx = parsed
     if action == "r":
         client = _client(context)
+        directory = state.get("directory") or None
         try:
-            await client.reject_question(state["request_id"])
+            if directory:
+                await client.reject_question(
+                    state["request_id"], directory=directory
+                )
+            else:
+                await client.reject_question(state["request_id"])
         except Exception:
             logger.exception("Failed to reject question %s", state.get("request_id"))
             await query.answer(QUESTION_SKIP_ERROR_TEXT, show_alert=True)
@@ -1979,7 +2024,9 @@ async def reconcile_questions(application) -> None:
             if str(request.get("sessionID") or "") != str(row["session_id"]):
                 continue
             try:
-                await present_question(application.bot, row, request)
+                await present_question(
+                    application.bot, row, request, directory=row["directory"]
+                )
             except Exception:
                 logger.exception(
                     "Could not present pending question %s", request.get("id")
@@ -1996,7 +2043,7 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     telegram_id = int(user_row["telegram_id"])
     state = PENDING_QUESTIONS.get(telegram_id)
-    if state is not None and state.get("awaiting_text"):
+    if state is not None:
         await _record_answer(context, telegram_id, state, [text])
         return
     await _process_prompt(update, context, user_row, text)
@@ -2144,7 +2191,11 @@ async def handle_event(event: dict, *, bot, client) -> None:
         if row is None:
             logger.info("Question request for unknown session %s", session_id)
             return
-        await present_question(bot, row, properties)
+        directory = None
+        session = database.get_opencode_session(int(row["id"]))
+        if session is not None:
+            directory = session["directory"]
+        await present_question(bot, row, properties, directory=directory)
         return
     if event_type in {"question.replied", "question.rejected"}:
         properties = event.get("properties") or {}

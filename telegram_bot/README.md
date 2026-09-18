@@ -136,9 +136,8 @@ question to the owning user with inline buttons:
   immediately;
 - multi-select: toggle buttons (`q:t:<qidx>:<oidx>`, toggled options marked
   `✅`) plus `✅ Done` (`q:d:<qidx>`);
-- free text: `✏️ Type answer` (`q:x:<qidx>`) sets `awaiting_text`, and the next
-  `text_message` is consumed as the answer instead of being forwarded as a
-  prompt;
+- free text: `✏️ Type answer` (`q:x:<qidx>`) is always available - it sets
+  `awaiting_text`, and the next `text_message` is consumed as the answer;
 - `🚫 Skip` (`q:r`) rejects the whole request via
   `POST /question/{requestID}/reject`.
 
@@ -149,6 +148,16 @@ in `PENDING_QUESTIONS` keyed by Telegram id; `question.replied` /
 stored session's pending questions (`GET /question?directory=...`) so a question
 that arrived before a restart is still surfaced. Callback data stays within
 Telegram's 64-byte limit.
+
+While a question is pending, plain text messages are never forwarded to
+opencode: any typed text is always taken as a free-text answer for the current
+question (opencode accepts one-element answer arrays even when `custom` is not
+set). The `✏️ Type answer` button is always shown, and a single-select question
+hints `Tap an option, or type your own answer.` `/status` re-surfaces the
+pending question and its buttons instead of the task status. `present_question`
+is re-entrant: reconciling the same `request_id` edits the existing message
+rather than sending duplicates, and a newer request replaces the previous
+state.
 
 ## Sessions
 
