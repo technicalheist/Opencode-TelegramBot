@@ -143,6 +143,27 @@ are stored but invisible to opencode. Outbound: the bot only reads `text` parts.
       local opencode server); handle all, and never send outside the session.
 - [x] Tests (no network; fake downloads/senders).
 
+### Phase 5 - question prompts (DONE)
+opencode's `question` tool blocks the agent until answered. The bot must surface
+`question.asked` events in Telegram (like permissions) — the SSE listener
+currently ignores them.
+
+- [x] `opencode_client.list_questions(*, directory=None)` (`GET /question`),
+      `reject_question(request_id)` (`POST /question/{id}/reject`); `reply_question`
+      already exists (`{"answers": [[labels], ...]}`).
+- [x] On `question.asked`, map `sessionID` → user and send the question(s) with
+      inline buttons: one button per option; `✅ Done` for multi-select; `✏️ Type
+      answer` when `custom`; `🚫 Skip` to reject.
+- [x] Collect answers for all questions in order, then call `reply_question`;
+      clear the pending state on `question.replied`/`question.rejected`.
+- [x] Callback data stays ≤64 bytes (per-user state + indices, no request id).
+- [x] `text_message` treats the next message as the answer when a question is
+      awaiting free-text input.
+- [x] On startup, reconcile pending questions (`GET /question`) so a question
+      that arrived before a restart is still surfaced.
+- [x] Only authenticated users; errors shown, not raised.
+- [x] Tests (no network).
+
 ## Tech Stack
 
 | Concern        | Choice                                                        |

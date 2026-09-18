@@ -264,6 +264,24 @@ def delete_opencode_session(user_id: int) -> bool:
     return cursor.rowcount > 0
 
 
+def list_opencode_sessions() -> list[sqlite3.Row]:
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                opencode_sessions.session_id AS session_id,
+                opencode_sessions.directory AS directory,
+                users.id AS id,
+                users.telegram_id AS telegram_id,
+                users.is_authenticated AS is_authenticated
+            FROM opencode_sessions
+            JOIN users ON users.id = opencode_sessions.user_id
+            ORDER BY opencode_sessions.updated_at DESC
+            """
+        ).fetchall()
+    return list(rows)
+
+
 def get_user_by_session_id(session_id: str) -> Optional[sqlite3.Row]:
     with closing(_connect()) as connection:
         return connection.execute(

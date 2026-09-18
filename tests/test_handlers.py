@@ -85,6 +85,9 @@ class FakeClient:
         self.get_last_activity = AsyncMock(return_value=None)
         self.get_last_assistant_message = AsyncMock(return_value=None)
         self.get_session_diff = AsyncMock(return_value=[])
+        self.list_questions = AsyncMock(return_value=[])
+        self.reply_question = AsyncMock()
+        self.reject_question = AsyncMock()
 
 
 class FakeDB:
@@ -95,6 +98,7 @@ class FakeDB:
         self.workdirs: dict[int, str] = {}
         self.models: dict[int, tuple[str, str]] = {}
         self.media: dict[int, dict] = {}
+        self.session_rows: list[dict] = []
 
     def upsert_user(self, *args, **kwargs):
         return self.row
@@ -151,6 +155,9 @@ class FakeDB:
             rows = [row for row in rows if row.get("user_id") == user_id]
         return rows[:limit]
 
+    def list_opencode_sessions(self):
+        return list(self.session_rows)
+
 
 def _row(*, telegram_id=111, authenticated=1):
     return {
@@ -198,6 +205,7 @@ def _clear_locks():
     handlers.WORKDIR_BROWSE.clear()
     handlers.ACTIVE_TASKS.clear()
     handlers.SENT_MEDIA.clear()
+    handlers.PENDING_QUESTIONS.clear()
     yield
     handlers.USER_LOCKS.clear()
     handlers.MODEL_CHOICES.clear()
@@ -205,6 +213,7 @@ def _clear_locks():
     handlers.WORKDIR_BROWSE.clear()
     handlers.ACTIVE_TASKS.clear()
     handlers.SENT_MEDIA.clear()
+    handlers.PENDING_QUESTIONS.clear()
 
 
 def test_split_message_at_exact_limit():
@@ -2307,3 +2316,376 @@ async def test_process_prompt_survives_media_delivery_error(monkeypatch):
     await handlers.text_message(update, _context(client))
 
     assert "hello from opencode" in update.effective_message.edits
+
+
+def _question_state(request_id="que_1", questions=None, index=0):
+    return {
+        "request_id": request_id,
+        "session_id": "ses_1",
+        "questions": questions
+        or [
+            {
+                "question": "Proceed?",
+                "header": "Confirm",
+                "options": [{"label": "Yes"}, {"label": "No"}],
+            }
+        ],
+        "index": index,
+        "answers": [],
+        "selections": set(),
+        "awaiting_text": False,
+        "chat_id": 111,
+        "message_id": 5,
+    }
+
+
+def _all_callback_data(keyboard):
+    return [button.callback_data for row in keyboard.inline_keyboard for button in row]
+
+
+def test_build_question_keyboard_single_select():
+    keyboard = handlers.build_question_keyboard(
+        {"options": [{"label": "Yes"}, {"label": "No"}]},
+        0,
+        set(),
+        multiple=False,
+        custom=False,
+    )
+
+    data = _all_callback_data(keyboard)
+    assert "q:a:0:0" in data
+    assert "q:a:0:1" in data
+    assert "q:r" in data
+    assert "q:d:0" not in data
+    assert "q:x:0" not in data
+    assert all(len(item.encode("utf-8")) <= 64 for item in data)
+
+
+def test_build_question_keyboard_multiple_marks_selected():
+    keyboard = handlers.build_question_keyboard(
+        {"options": [{"label": "A"}, {"label": "B"}]},
+        1,
+        {"A"},
+        multiple=True,
+        custom=True,
+    )
+
+    data = _all_callback_data(keyboard)
+    assert "q:t:1:0" in data
+    assert "q:t:1:1" in data
+    assert "q:d:1" in data
+    assert "q:x:1" in data
+    assert "q:r" in data
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+    assert labels[0].startswith("✅")
+    assert not labels[1].startswith("✅")
+    assert all(len(item.encode("utf-8")) <= 64 for item in data)
+
+
+def test_parse_question_callback_round_trips():
+    assert handlers.parse_question_callback("q:a:0:1") == ("a", 0, 1)
+    assert handlers.parse_question_callback("q:t:1:2") == ("t", 1, 2)
+    assert handlers.parse_question_callback("q:d:0") == ("d", 0, None)
+    assert handlers.parse_question_callback("q:x:0") == ("x", 0, None)
+    assert handlers.parse_question_callback("q:r") == ("r", None, None)
+    assert handlers.parse_question_callback("q:a:0") is None
+    assert handlers.parse_question_callback("q:z:0:0") is None
+    assert handlers.parse_question_callback("q:a:x:0") is None
+    assert handlers.parse_question_callback("mdl:m0") is None
+    assert handlers.parse_question_callback("") is None
+
+
+@pytest.mark.asyncio
+async def test_question_callback_single_select_submits(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    context = _context(client)
+    query = FakeQuery("q:a:0:0", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, context)
+
+    client.reply_question.assert_awaited_once_with("que_1", [["Yes"]])
+    assert 111 not in handlers.PENDING_QUESTIONS
+    assert query.answer.await_count == 1
+    assert context.bot.edit_message_text.await_args.kwargs["text"] == (
+        handlers.QUESTION_SUBMITTED_TEXT
+    )
+
+
+@pytest.mark.asyncio
+async def test_question_callback_multi_toggle_then_done(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    question = {
+        "question": "Pick some",
+        "options": [{"label": "A"}, {"label": "B"}],
+        "multiple": True,
+    }
+    handlers.PENDING_QUESTIONS[111] = _question_state(questions=[question])
+    context = _context(client)
+
+    toggle_a = FakeQuery("q:t:0:0", from_user=SimpleNamespace(id=111))
+    await handlers.question_callback(
+        SimpleNamespace(
+            callback_query=toggle_a, effective_user=SimpleNamespace(id=111)
+        ),
+        context,
+    )
+    assert toggle_a.answer.await_count == 1
+    assert handlers.PENDING_QUESTIONS[111]["selections"] == {"A"}
+    assert context.bot.edit_message_text.await_args.kwargs["reply_markup"] is not None
+
+    toggle_b = FakeQuery("q:t:0:1", from_user=SimpleNamespace(id=111))
+    await handlers.question_callback(
+        SimpleNamespace(
+            callback_query=toggle_b, effective_user=SimpleNamespace(id=111)
+        ),
+        context,
+    )
+    assert handlers.PENDING_QUESTIONS[111]["selections"] == {"A", "B"}
+
+    done = FakeQuery("q:d:0", from_user=SimpleNamespace(id=111))
+    await handlers.question_callback(
+        SimpleNamespace(callback_query=done, effective_user=SimpleNamespace(id=111)),
+        context,
+    )
+    assert done.answer.await_count == 1
+    client.reply_question.assert_awaited_once_with("que_1", [["A", "B"]])
+    assert 111 not in handlers.PENDING_QUESTIONS
+
+
+@pytest.mark.asyncio
+async def test_question_callback_custom_then_text_message(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    question = {"question": "Name?", "options": [], "custom": True}
+    handlers.PENDING_QUESTIONS[111] = _question_state(questions=[question])
+    context = _context(client)
+
+    type_button = FakeQuery("q:x:0", from_user=SimpleNamespace(id=111))
+    await handlers.question_callback(
+        SimpleNamespace(
+            callback_query=type_button, effective_user=SimpleNamespace(id=111)
+        ),
+        context,
+    )
+    assert handlers.PENDING_QUESTIONS[111]["awaiting_text"] is True
+
+    update = _update(text="my free answer")
+    await handlers.text_message(update, context)
+
+    client.reply_question.assert_awaited_once_with("que_1", [["my free answer"]])
+    client.send_prompt.assert_not_awaited()
+    assert 111 not in handlers.PENDING_QUESTIONS
+
+
+@pytest.mark.asyncio
+async def test_question_callback_skip_rejects(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    context = _context(client)
+    query = FakeQuery("q:r", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, context)
+
+    client.reject_question.assert_awaited_once_with("que_1")
+    client.reply_question.assert_not_awaited()
+    assert 111 not in handlers.PENDING_QUESTIONS
+    assert query.answer.await_count == 1
+    assert context.bot.edit_message_text.await_args.kwargs["text"] == (
+        handlers.QUESTION_SKIPPED_TEXT
+    )
+
+
+@pytest.mark.asyncio
+async def test_question_callback_expired_alerts(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    query = FakeQuery("q:r", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, _context(client))
+
+    client.reject_question.assert_not_awaited()
+    assert query.answer.await_count == 1
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_question_callback_unauthenticated_refused(monkeypatch):
+    db = FakeDB(_row(authenticated=0))
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    query = FakeQuery("q:r", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.question_callback(update, _context(client))
+
+    client.reject_question.assert_not_awaited()
+    assert 111 in handlers.PENDING_QUESTIONS
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_question_asked_event_sends_message(monkeypatch):
+    row = _row()
+    db = FakeDB(row)
+    db.sessions[1] = {"session_id": "ses_1", "directory": "D:/x"}
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=7))
+    )
+    event = {
+        "type": "question.asked",
+        "properties": {
+            "id": "que_1",
+            "sessionID": "ses_1",
+            "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}],
+        },
+    }
+
+    await handlers.handle_event(event, bot=bot, client=FakeClient())
+
+    bot.send_message.assert_awaited_once()
+    assert 111 in handlers.PENDING_QUESTIONS
+    assert handlers.PENDING_QUESTIONS[111]["message_id"] == 7
+    data = _all_callback_data(
+        bot.send_message.await_args.kwargs["reply_markup"]
+    )
+    assert "q:r" in data
+
+
+@pytest.mark.asyncio
+async def test_question_asked_event_ignores_unknown_session(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(send_message=AsyncMock())
+
+    await handlers.handle_event(
+        {
+            "type": "question.asked",
+            "properties": {"id": "que_1", "sessionID": "ses_unknown", "questions": []},
+        },
+        bot=bot,
+        client=FakeClient(),
+    )
+
+    bot.send_message.assert_not_awaited()
+    assert handlers.PENDING_QUESTIONS == {}
+
+
+@pytest.mark.asyncio
+async def test_question_replied_event_clears_state(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    bot = SimpleNamespace(send_message=AsyncMock())
+
+    await handlers.handle_event(
+        {
+            "type": "question.replied",
+            "properties": {"sessionID": "ses_1", "requestID": "que_1"},
+        },
+        bot=bot,
+        client=FakeClient(),
+    )
+
+    assert handlers.PENDING_QUESTIONS == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_questions_surfaces_pending(monkeypatch):
+    db = FakeDB(_row())
+    db.session_rows = [
+        {
+            "session_id": "ses_1",
+            "directory": "D:/x",
+            "id": 1,
+            "telegram_id": 111,
+            "is_authenticated": 1,
+        }
+    ]
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.list_questions = AsyncMock(
+        return_value=[
+            {
+                "id": "que_1",
+                "sessionID": "ses_1",
+                "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}],
+            }
+        ]
+    )
+    bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=9))
+    )
+    application = SimpleNamespace(bot_data={"opencode": client}, bot=bot)
+
+    await handlers.reconcile_questions(application)
+
+    client.list_questions.assert_awaited_once_with(directory="D:/x")
+    assert 111 in handlers.PENDING_QUESTIONS
+    bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_questions_tolerates_client_errors(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    db.session_rows = [
+        {
+            "session_id": "ses_1",
+            "directory": "D:/x",
+            "id": 1,
+            "telegram_id": 111,
+            "is_authenticated": 1,
+        }
+    ]
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.list_questions = AsyncMock(side_effect=OpenCodeError("boom"))
+    application = SimpleNamespace(bot_data={"opencode": client}, bot=object())
+
+    await handlers.reconcile_questions(application)
+
+    assert handlers.PENDING_QUESTIONS == {}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_questions_skips_unauthenticated(monkeypatch):
+    db = FakeDB(_row(authenticated=0))
+    db.session_rows = [
+        {
+            "session_id": "ses_1",
+            "directory": "D:/x",
+            "id": 1,
+            "telegram_id": 111,
+            "is_authenticated": 0,
+        }
+    ]
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    application = SimpleNamespace(bot_data={"opencode": client}, bot=object())
+
+    await handlers.reconcile_questions(application)
+
+    client.list_questions.assert_not_awaited()

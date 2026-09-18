@@ -126,6 +126,30 @@ once**, **Always**, and **Reject**. Tapping a button calls
 is edited to show the decision. Prompts are serialized per Telegram user with an
 `asyncio.Lock`.
 
+## Question prompts (Phase 5)
+
+opencode's `question` tool blocks the agent until answered. The SSE listener
+handles `question.asked` and, via `database.get_user_by_session_id`, sends the
+question to the owning user with inline buttons:
+
+- single-select: one button per option (`q:a:<qidx>:<oidx>`) that submits
+  immediately;
+- multi-select: toggle buttons (`q:t:<qidx>:<oidx>`, toggled options marked
+  `✅`) plus `✅ Done` (`q:d:<qidx>`);
+- free text: `✏️ Type answer` (`q:x:<qidx>`) sets `awaiting_text`, and the next
+  `text_message` is consumed as the answer instead of being forwarded as a
+  prompt;
+- `🚫 Skip` (`q:r`) rejects the whole request via
+  `POST /question/{requestID}/reject`.
+
+Answers are collected in order and submitted with
+`POST /question/{requestID}/reply` as `{"answers": [[...], ...]}`. State lives
+in `PENDING_QUESTIONS` keyed by Telegram id; `question.replied` /
+`question.rejected` events clear it. On startup `reconcile_questions` lists each
+stored session's pending questions (`GET /question?directory=...`) so a question
+that arrived before a restart is still surfaced. Callback data stays within
+Telegram's 64-byte limit.
+
 ## Sessions
 
 One persistent opencode session is stored per user in `opencode_sessions`

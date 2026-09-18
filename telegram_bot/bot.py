@@ -86,20 +86,29 @@ async def post_init(application: Application) -> None:
     application.bot_data["sse_task"] = application.create_task(
         _listen_events(application), name="opencode-sse-listener"
     )
+    application.bot_data["reconcile_task"] = application.create_task(
+        handlers.reconcile_questions(application),
+        name="opencode-question-reconcile",
+    )
     await application.bot.set_my_commands(BOT_COMMANDS)
     logger.info("Bot started")
 
 
 async def post_shutdown(application: Application) -> None:
-    task = application.bot_data.pop("sse_task", None)
-    if task is not None:
+    for key, label in (
+        ("sse_task", "event listener"),
+        ("reconcile_task", "question reconciler"),
+    ):
+        task = application.bot_data.pop(key, None)
+        if task is None:
+            continue
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("Error while stopping the event listener")
+            logger.exception("Error while stopping the %s", label)
     client = application.bot_data.pop("opencode", None)
     if client is not None:
         try:
@@ -161,6 +170,9 @@ def build_application() -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(handlers.media_callback, pattern=r"^media:\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(handlers.question_callback, pattern=r"^q:")
     )
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, handlers.voice_message)

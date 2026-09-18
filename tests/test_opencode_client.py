@@ -267,6 +267,56 @@ async def test_reply_question_posts_answers(tmp_path):
     assert captured["body"] == {"answers": ["a", "b"]}
 
 
+@pytest.mark.asyncio
+async def test_list_questions_returns_list_with_directory(tmp_path):
+    questions = [{"id": "que_1", "sessionID": "ses_1", "questions": []}]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/question"
+        assert request.url.params.get("directory") == str(tmp_path)
+        return httpx.Response(200, json=questions)
+
+    oc = _make(handler, tmp_path)
+    assert await oc.list_questions() == questions
+
+
+@pytest.mark.asyncio
+async def test_list_questions_raises_on_error(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    oc = _make(handler, tmp_path)
+    with pytest.raises(OpenCodeError):
+        await oc.list_questions()
+
+
+@pytest.mark.asyncio
+async def test_reject_question_posts_reject(tmp_path):
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(200, json={})
+
+    oc = _make(handler, tmp_path)
+    await oc.reject_question("que_1")
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/question/que_1/reject"
+
+
+@pytest.mark.asyncio
+async def test_reject_question_raises_on_error(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="missing")
+
+    oc = _make(handler, tmp_path)
+    with pytest.raises(OpenCodeError):
+        await oc.reject_question("que_1")
+
+
 def test_parse_sse_lines_handles_comments_keepalives_and_multiline():
     lines = [
         ": keepalive",

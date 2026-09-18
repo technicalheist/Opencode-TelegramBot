@@ -150,6 +150,14 @@ _MEDIA_SENDERS = {
 USER_LOCKS: dict[int, asyncio.Lock] = {}
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 ACTIVE_TASKS: dict[int, dict] = {}
+PENDING_QUESTIONS: dict[int, dict] = {}
+
+QUESTION_EXPIRED_TEXT = "This question expired. Please wait for a new prompt."
+QUESTION_SKIPPED_TEXT = "🚫 Question skipped."
+QUESTION_SUBMITTED_TEXT = "✅ Answers submitted."
+QUESTION_SUBMIT_ERROR_TEXT = "Could not submit answers to opencode."
+QUESTION_SKIP_ERROR_TEXT = "Could not skip the question."
+QUESTION_TYPE_PROMPT_TEXT = "✏️ Type your answer as a message."
 
 TODO_ICONS = {
     "pending": "⬜",
@@ -436,6 +444,89 @@ def parse_workdir_callback(data: str) -> Optional[tuple[str, Optional[str]]]:
                 return action, value
             return None
     return None
+
+
+def _parse_index(value: str) -> Optional[int]:
+    if not value.isdigit():
+        return None
+    return int(value)
+
+
+def parse_question_callback(
+    data: str,
+) -> Optional[tuple[str, Optional[int], Optional[int]]]:
+    raw = data or ""
+    if not raw.startswith("q:"):
+        return None
+    parts = raw.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "r":
+        return ("r", None, None) if len(parts) == 2 else None
+    if action in {"d", "x"}:
+        if len(parts) != 3:
+            return None
+        return (action, _parse_index(parts[2]), None)
+    if action in {"a", "t"}:
+        if len(parts) != 4:
+            return None
+        qidx = _parse_index(parts[2])
+        oidx = _parse_index(parts[3])
+        if qidx is None or oidx is None:
+            return None
+        return (action, qidx, oidx)
+    return None
+
+
+def build_question_keyboard(
+    question: dict,
+    qidx: int,
+    selected: set,
+    *,
+    multiple: bool,
+    custom: bool,
+) -> InlineKeyboardMarkup:
+    options = question.get("options") if isinstance(question, dict) else None
+    rows: list[list[InlineKeyboardButton]] = []
+    for oidx, option in enumerate(options or []):
+        label = str(option.get("label") or f"Option {oidx + 1}") if isinstance(option, dict) else str(option)
+        action = "t" if multiple else "a"
+        text = f"✅ {label}" if multiple and label in selected else label
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text[:60], callback_data=f"q:{action}:{qidx}:{oidx}"
+                )
+            ]
+        )
+    footer: list[InlineKeyboardButton] = []
+    if multiple:
+        footer.append(InlineKeyboardButton("✅ Done", callback_data=f"q:d:{qidx}"))
+    if custom:
+        footer.append(
+            InlineKeyboardButton("✏️ Type answer", callback_data=f"q:x:{qidx}")
+        )
+    if footer:
+        rows.append(footer)
+    rows.append([InlineKeyboardButton("🚫 Skip", callback_data="q:r")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _question_text(state: dict) -> str:
+    questions = state.get("questions") or []
+    index = int(state.get("index") or 0)
+    if index >= len(questions):
+        return QUESTION_SUBMITTED_TEXT
+    question = questions[index] if isinstance(questions[index], dict) else {}
+    lines = [f"❓ Question {index + 1}/{len(questions)}"]
+    header = str(question.get("header") or "").strip()
+    if header:
+        lines.append(header)
+    body = str(question.get("question") or "").strip()
+    if body:
+        lines.append(body)
+    if question.get("multiple"):
+        lines.append("Select one or more options, then tap ✅ Done.")
+    return "\n".join(lines)
 
 
 def model_payload(telegram_id: int) -> Optional[dict]:
@@ -1675,6 +1766,226 @@ async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await _process_prompt(update, context, user_row, transcript)
 
 
+async def _edit_question_message(context, state: dict, text: str) -> None:
+    message_id = state.get("message_id")
+    if message_id is None:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=state["chat_id"], message_id=message_id, text=text
+        )
+    except Exception:
+        logger.warning("Could not update question message", exc_info=True)
+
+
+async def _show_current_question(bot, telegram_id: int, *, edit: bool = False) -> None:
+    state = PENDING_QUESTIONS.get(telegram_id)
+    if state is None:
+        return
+    questions = state.get("questions") or []
+    index = int(state.get("index") or 0)
+    if index >= len(questions):
+        return
+    question = questions[index] if isinstance(questions[index], dict) else {}
+    keyboard = build_question_keyboard(
+        question,
+        index,
+        state.get("selections") or set(),
+        multiple=bool(question.get("multiple")),
+        custom=bool(question.get("custom")),
+    )
+    text = _question_text(state)
+    if edit and state.get("message_id") is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=state["chat_id"],
+                message_id=state["message_id"],
+                text=text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            logger.warning("Could not edit question message", exc_info=True)
+    try:
+        sent = await bot.send_message(
+            chat_id=state["chat_id"], text=text, reply_markup=keyboard
+        )
+        state["message_id"] = getattr(sent, "message_id", None)
+    except Exception:
+        logger.exception("Could not send question message")
+
+
+async def present_question(bot, user_row, request) -> None:
+    questions = request.get("questions") if isinstance(request, dict) else None
+    if not questions:
+        return
+    telegram_id = int(user_row["telegram_id"])
+    PENDING_QUESTIONS[telegram_id] = {
+        "request_id": str(request.get("id") or ""),
+        "session_id": str(request.get("sessionID") or ""),
+        "questions": list(questions),
+        "index": 0,
+        "answers": [],
+        "selections": set(),
+        "awaiting_text": False,
+        "chat_id": telegram_id,
+        "message_id": None,
+    }
+    await _show_current_question(bot, telegram_id)
+
+
+async def _record_answer(
+    context, telegram_id: int, state: dict, answer: list[str]
+) -> None:
+    state["answers"].append(list(answer))
+    state["index"] = int(state.get("index") or 0) + 1
+    state["selections"] = set()
+    state["awaiting_text"] = False
+    if state["index"] < len(state.get("questions") or []):
+        await _show_current_question(context.bot, telegram_id, edit=True)
+        return
+    client = _client(context)
+    try:
+        await client.reply_question(state["request_id"], state["answers"])
+    except Exception:
+        logger.exception("Failed to reply to question %s", state.get("request_id"))
+        PENDING_QUESTIONS.pop(telegram_id, None)
+        await _edit_question_message(context, state, QUESTION_SUBMIT_ERROR_TEXT)
+        return
+    PENDING_QUESTIONS.pop(telegram_id, None)
+    await _edit_question_message(context, state, QUESTION_SUBMITTED_TEXT)
+
+
+async def question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    parsed = parse_question_callback(query.data or "")
+    if parsed is None:
+        await query.answer()
+        return
+    caller = getattr(query, "from_user", None)
+    telegram_id = int(caller.id) if caller is not None else None
+    row = (
+        database.get_user_by_telegram_id(telegram_id)
+        if telegram_id is not None
+        else None
+    )
+    if row is None or not bool(row["is_authenticated"]):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    state = PENDING_QUESTIONS.get(telegram_id)
+    if state is None:
+        await query.answer(QUESTION_EXPIRED_TEXT, show_alert=True)
+        return
+    action, qidx, oidx = parsed
+    if action == "r":
+        client = _client(context)
+        try:
+            await client.reject_question(state["request_id"])
+        except Exception:
+            logger.exception("Failed to reject question %s", state.get("request_id"))
+            await query.answer(QUESTION_SKIP_ERROR_TEXT, show_alert=True)
+            return
+        PENDING_QUESTIONS.pop(telegram_id, None)
+        await query.answer()
+        await _edit_question_message(context, state, QUESTION_SKIPPED_TEXT)
+        return
+    if qidx is None or qidx != int(state.get("index") or 0):
+        await query.answer("That question is no longer current.", show_alert=True)
+        return
+    questions = state.get("questions") or []
+    question = questions[qidx] if qidx < len(questions) and isinstance(questions[qidx], dict) else {}
+    options = question.get("options") or []
+    multiple = bool(question.get("multiple"))
+    if action == "t":
+        if not multiple or oidx is None or not (0 <= oidx < len(options)):
+            await query.answer()
+            return
+        label = str(options[oidx].get("label") or "") if isinstance(options[oidx], dict) else str(options[oidx])
+        selections = state.setdefault("selections", set())
+        if label in selections:
+            selections.discard(label)
+        else:
+            selections.add(label)
+        await query.answer()
+        await _show_current_question(context.bot, telegram_id, edit=True)
+        return
+    if action == "x":
+        state["awaiting_text"] = True
+        await query.answer()
+        await _edit_question_message(
+            context, state, f"{_question_text(state)}\n\n{QUESTION_TYPE_PROMPT_TEXT}"
+        )
+        return
+    if action == "a":
+        if oidx is None or not (0 <= oidx < len(options)):
+            await query.answer("That option is no longer available.", show_alert=True)
+            return
+        option = options[oidx]
+        label = str(option.get("label") or "") if isinstance(option, dict) else str(option)
+        await query.answer()
+        await _record_answer(context, telegram_id, state, [label])
+        return
+    if action == "d":
+        if not multiple:
+            await query.answer()
+            return
+        answer = [
+            str(option.get("label") or "")
+            for option in options
+            if isinstance(option, dict)
+            and str(option.get("label") or "") in (state.get("selections") or set())
+        ]
+        if not answer:
+            await query.answer("Select at least one option.", show_alert=True)
+            return
+        await query.answer()
+        await _record_answer(context, telegram_id, state, answer)
+        return
+    await query.answer()
+
+
+def _clear_question_state(session_id: str, request_id: str) -> None:
+    for telegram_id, state in list(PENDING_QUESTIONS.items()):
+        if request_id and str(state.get("request_id")) == request_id:
+            PENDING_QUESTIONS.pop(telegram_id, None)
+        elif session_id and str(state.get("session_id")) == session_id:
+            PENDING_QUESTIONS.pop(telegram_id, None)
+
+
+async def reconcile_questions(application) -> None:
+    client = application.bot_data.get("opencode")
+    if client is None:
+        return
+    try:
+        sessions = database.list_opencode_sessions()
+    except Exception:
+        logger.exception("Could not list sessions for question reconciliation")
+        return
+    for row in sessions:
+        try:
+            if not bool(row["is_authenticated"]):
+                continue
+            questions = await client.list_questions(directory=row["directory"])
+        except Exception:
+            logger.exception(
+                "Could not list questions for session %s", row["session_id"]
+            )
+            continue
+        for request in questions or []:
+            if not isinstance(request, dict):
+                continue
+            if str(request.get("sessionID") or "") != str(row["session_id"]):
+                continue
+            try:
+                await present_question(application.bot, row, request)
+            except Exception:
+                logger.exception(
+                    "Could not present pending question %s", request.get("id")
+                )
+
+
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_row = await _require_authenticated(update)
     if user_row is None:
@@ -1682,6 +1993,11 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.effective_message
     text = (message.text or "").strip()
     if not text:
+        return
+    telegram_id = int(user_row["telegram_id"])
+    state = PENDING_QUESTIONS.get(telegram_id)
+    if state is not None and state.get("awaiting_text"):
+        await _record_answer(context, telegram_id, state, [text])
         return
     await _process_prompt(update, context, user_row, text)
 
@@ -1793,27 +2109,51 @@ async def session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def handle_event(event: dict, *, bot, client) -> None:
-    if not isinstance(event, dict) or event.get("type") != "permission.asked":
+    if not isinstance(event, dict):
         return
-    request = PermissionRequest.from_event(event)
-    if not request.id or not request.session_id:
-        logger.warning("Ignoring malformed permission.asked event: %s", event)
+    event_type = event.get("type")
+    if event_type == "permission.asked":
+        request = PermissionRequest.from_event(event)
+        if not request.id or not request.session_id:
+            logger.warning("Ignoring malformed permission.asked event: %s", event)
+            return
+        row = database.get_user_by_session_id(request.session_id)
+        if row is None:
+            logger.info("Permission request for unknown session %s", request.session_id)
+            return
+        text = f"opencode needs permission: {request.permission}"
+        if request.patterns:
+            text += "\n\n" + "\n".join(f"• {pattern}" for pattern in request.patterns)
+        try:
+            await bot.send_message(
+                chat_id=int(row["telegram_id"]),
+                text=text,
+                reply_markup=build_permission_keyboard(request),
+            )
+        except Exception:
+            logger.exception("Failed to surface permission request %s", request.id)
         return
-    row = database.get_user_by_session_id(request.session_id)
-    if row is None:
-        logger.info("Permission request for unknown session %s", request.session_id)
+    if event_type == "question.asked":
+        properties = event.get("properties") or {}
+        request_id = str(properties.get("id") or "")
+        session_id = str(properties.get("sessionID") or "")
+        if not request_id or not session_id:
+            logger.warning("Ignoring malformed question.asked event: %s", event)
+            return
+        row = database.get_user_by_session_id(session_id)
+        if row is None:
+            logger.info("Question request for unknown session %s", session_id)
+            return
+        await present_question(bot, row, properties)
         return
-    text = f"opencode needs permission: {request.permission}"
-    if request.patterns:
-        text += "\n\n" + "\n".join(f"• {pattern}" for pattern in request.patterns)
-    try:
-        await bot.send_message(
-            chat_id=int(row["telegram_id"]),
-            text=text,
-            reply_markup=build_permission_keyboard(request),
+    if event_type in {"question.replied", "question.rejected"}:
+        properties = event.get("properties") or {}
+        _clear_question_state(
+            str(properties.get("sessionID") or ""),
+            str(properties.get("requestID") or ""),
         )
-    except Exception:
-        logger.exception("Failed to surface permission request %s", request.id)
+        return
+    return
 
 
 def admin_only(update: Update) -> bool:

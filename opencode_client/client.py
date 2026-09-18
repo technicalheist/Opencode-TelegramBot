@@ -630,6 +630,24 @@ class OpenCodeClient:
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
 
+    async def list_questions(
+        self, *, directory: str | Path | None = None
+    ) -> list[dict]:
+        path = "/question"
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path), params=self._params(directory), timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Question list response was not valid JSON.") from exc
+        if not isinstance(body, list):
+            raise OpenCodeError("Question list response was not a JSON array.")
+        return body
+
     async def reply_question(self, request_id: str, answers: list) -> None:
         path = f"/question/{request_id}/reply"
         async with self._http() as client:
@@ -637,6 +655,17 @@ class OpenCodeClient:
                 self._url(path),
                 params=self._params(),
                 json={"answers": answers},
+                timeout=self._timeout,
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
+
+    async def reject_question(self, request_id: str) -> None:
+        path = f"/question/{request_id}/reject"
+        async with self._http() as client:
+            response = await client.post(
+                self._url(path),
+                params=self._params(),
                 timeout=self._timeout,
             )
         if response.status_code >= 400:
