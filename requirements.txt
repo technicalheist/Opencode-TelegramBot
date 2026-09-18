@@ -1,0 +1,6 @@
+python-telegram-bot~=22.0
+python-dotenv
+httpx
+edge-tts
+pytest
+pytest-asyncio
