@@ -42,6 +42,7 @@ BOT_COMMANDS = [
     BotCommand("compact", "Compact the active session"),
     BotCommand("mcp", "List MCP servers, status, and tools"),
     BotCommand("status", "Show the current task status"),
+    BotCommand("server", "Add, list, or switch opencode servers"),
     BotCommand("whoami", "Show your profile and settings"),
     BotCommand("id", "Show your Telegram ID"),
     BotCommand("list", "List your stored media"),
@@ -60,8 +61,24 @@ MEDIA_FILTER = (
 )
 
 
-async def _listen_events(application: Application, directory: str) -> None:
-    client = application.bot_data["opencode"]
+def _normalize_base_url(value) -> str:
+    return str(value or "").rstrip("/")
+
+
+def _row_base_url(row) -> str:
+    try:
+        value = row["base_url"]
+    except (KeyError, IndexError):
+        value = None
+    return _normalize_base_url(value) or _normalize_base_url(
+        config.OPENCODE_BASE_URL
+    )
+
+
+async def _listen_events(
+    application: Application, base_url: str, directory: str
+) -> None:
+    client = handlers._client_for_base_url(application, base_url)
     while True:
         try:
             async for event in client.stream_events(directory=directory):
@@ -72,51 +89,59 @@ async def _listen_events(application: Application, directory: str) -> None:
             raise
         except Exception:
             logger.exception(
-                "opencode event stream error for %s; reconnecting in %ss",
+                "opencode event stream error for %s (%s); reconnecting in %ss",
+                base_url,
                 directory,
                 EVENT_RETRY_DELAY,
             )
         await asyncio.sleep(EVENT_RETRY_DELAY)
 
 
-def desired_event_directories() -> set[str]:
-    directories = {str(config.OPENCODE_DIRECTORY)}
+def desired_event_subscriptions() -> set[tuple[str, str]]:
+    subscriptions = {
+        (_normalize_base_url(config.OPENCODE_BASE_URL), str(config.OPENCODE_DIRECTORY))
+    }
     try:
         rows = database.list_opencode_sessions()
     except Exception:
         logger.exception("Could not list sessions for event subscriptions")
-        return directories
+        return subscriptions
     for row in rows:
         if not bool(row["is_authenticated"]):
             continue
         directory = row["directory"]
         if directory:
-            directories.add(str(directory))
-    return directories
+            subscriptions.add((_row_base_url(row), str(directory)))
+    return subscriptions
 
 
-def reconcile_event_tasks(application: Application, directories: set[str]) -> None:
+def reconcile_event_tasks(
+    application: Application, subscriptions: set[tuple[str, str]]
+) -> None:
     tasks: dict[str, asyncio.Task] = application.bot_data.setdefault(
         "event_tasks", {}
     )
-    wanted = set(directories)
-    for directory in list(tasks):
-        if directory not in wanted:
-            task = tasks.pop(directory)
+    wanted = {
+        f"{base_url}::{directory}": (base_url, directory)
+        for base_url, directory in subscriptions
+    }
+    for key in list(tasks):
+        if key not in wanted:
+            task = tasks.pop(key)
             task.cancel()
-    for directory in wanted:
-        existing = tasks.get(directory)
+    for key, (base_url, directory) in wanted.items():
+        existing = tasks.get(key)
         if existing is not None and not existing.done():
             continue
-        tasks[directory] = application.create_task(
-            _listen_events(application, directory), name=f"events:{directory}"
+        tasks[key] = application.create_task(
+            _listen_events(application, base_url, directory), name=f"events:{key}"
         )
 
 
 async def _supervise_events(application: Application) -> None:
     while True:
         try:
-            reconcile_event_tasks(application, desired_event_directories())
+            reconcile_event_tasks(application, desired_event_subscriptions())
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -137,12 +162,14 @@ async def post_init(application: Application) -> None:
     config.ensure_dirs()
     database.init_db()
     database.seed_admin(config.ADMIN_USER_ID)
+    database.ensure_default_server(config.OPENCODE_BASE_URL)
     try:
         setup_result = opencode_setup.install_all()
         logger.info("opencode setup install result: %s", setup_result)
     except Exception:
         logger.exception("opencode setup install failed")
     application.bot_data["opencode"] = OpenCodeClient()
+    application.bot_data["opencode_clients"] = {}
     application.bot_data["user_locks"] = handlers.USER_LOCKS
     application.bot_data["refresh_events"] = asyncio.Event()
     application.bot_data["event_tasks"] = {}
@@ -184,12 +211,16 @@ async def post_shutdown(application: Application) -> None:
             logger.exception(
                 "Error while stopping event listener for %s", directory
             )
-    client = application.bot_data.pop("opencode", None)
-    if client is not None:
+    clients = [application.bot_data.pop("opencode", None)]
+    registry = application.bot_data.pop("opencode_clients", {}) or {}
+    clients.extend(registry.values())
+    for client in clients:
+        if client is None:
+            continue
         try:
             await client.close()
         except Exception:
-            logger.exception("Error while closing the opencode client")
+            logger.exception("Error while closing an opencode client")
     logger.info("Bot stopped")
 
 
@@ -211,6 +242,9 @@ def build_application() -> Application:
         .post_shutdown(post_shutdown)
         .build()
     )
+    application.add_handler(
+        MessageHandler(filters.ALL, handlers.guard_unauthenticated), group=-1
+    )
     application.add_handler(CommandHandler("start", handlers.start))
     application.add_handler(CommandHandler("help", handlers.help_command))
     application.add_handler(CommandHandler("id", handlers.id_command))
@@ -224,6 +258,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("compact", handlers.compact_command))
     application.add_handler(CommandHandler("mcp", handlers.mcp_command))
     application.add_handler(CommandHandler("status", handlers.status_command))
+    application.add_handler(CommandHandler("server", handlers.server_command))
+    application.add_handler(CommandHandler("skip", handlers.skip_command))
+    application.add_handler(CommandHandler("cancel", handlers.cancel_command))
     application.add_handler(CommandHandler("list", handlers.list_command))
     application.add_handler(CommandHandler("get", handlers.get_command))
     application.add_handler(
@@ -248,6 +285,14 @@ def build_application() -> Application:
     )
     application.add_handler(
         CallbackQueryHandler(handlers.question_callback, pattern=r"^q:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            handlers.server_callback, pattern=r"^srv:(use:\d+|add|rm:\d+)$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(handlers.auth_callback, pattern=r"^auth:(ok|no):\d+$")
     )
     application.add_handler(
         MessageHandler(filters.VOICE | filters.AUDIO, handlers.voice_message)

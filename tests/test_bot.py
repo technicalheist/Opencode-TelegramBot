@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 import config
-from telegram.ext import CommandHandler
-from telegram_bot import bot
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler
+from telegram_bot import bot, handlers
 
 FAKE_TOKEN = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
 
@@ -60,29 +63,59 @@ def test_build_application_registers_new_handlers(monkeypatch):
     )
 
 
-def test_desired_event_directories_includes_config_and_sessions(monkeypatch, tmp_path):
+def test_build_application_registers_auth_gate_in_lower_group(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", FAKE_TOKEN)
+
+    application = bot.build_application()
+
+    assert -1 in application.handlers
+    assert any(
+        isinstance(handler, MessageHandler)
+        and handler.callback is handlers.guard_unauthenticated
+        for handler in application.handlers[-1]
+    )
+
+
+def test_build_application_registers_auth_callback(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", FAKE_TOKEN)
+
+    application = bot.build_application()
+
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback is handlers.auth_callback
+        for group in application.handlers.values()
+        for handler in group
+    )
+
+
+def test_desired_event_subscriptions_includes_default_and_sessions(
+    monkeypatch, tmp_path
+):
     config_dir = tmp_path / "repo"
     monkeypatch.setattr(bot.config, "OPENCODE_DIRECTORY", config_dir)
+    monkeypatch.setattr(bot.config, "OPENCODE_BASE_URL", "http://localhost:4096")
     rows = [
-        {"directory": "D:/jcp", "is_authenticated": 1},
-        {"directory": "D:/other", "is_authenticated": 1},
-        {"directory": "D:/unauthed", "is_authenticated": 0},
-        {"directory": "", "is_authenticated": 1},
+        {"directory": "D:/jcp", "is_authenticated": 1, "base_url": "http://other:4096"},
+        {"directory": "D:/other", "is_authenticated": 1, "base_url": None},
+        {"directory": "D:/unauthed", "is_authenticated": 0, "base_url": "http://x:1"},
+        {"directory": "", "is_authenticated": 1, "base_url": "http://y:1"},
     ]
     monkeypatch.setattr(bot, "database", _FakeDB(rows))
 
-    directories = bot.desired_event_directories()
+    subscriptions = bot.desired_event_subscriptions()
 
-    assert str(config_dir) in directories
-    assert "D:/jcp" in directories
-    assert "D:/other" in directories
-    assert "D:/unauthed" not in directories
-    assert "" not in directories
+    assert ("http://localhost:4096", str(config_dir)) in subscriptions
+    assert ("http://other:4096", "D:/jcp") in subscriptions
+    assert ("http://localhost:4096", "D:/other") in subscriptions
+    assert ("http://x:1", "D:/unauthed") not in subscriptions
+    assert not any(directory == "" for _, directory in subscriptions)
 
 
-def test_desired_event_directories_tolerates_db_error(monkeypatch, tmp_path):
+def test_desired_event_subscriptions_tolerates_db_error(monkeypatch, tmp_path):
     config_dir = tmp_path / "repo"
     monkeypatch.setattr(bot.config, "OPENCODE_DIRECTORY", config_dir)
+    monkeypatch.setattr(bot.config, "OPENCODE_BASE_URL", "http://localhost:4096")
 
     class _BrokenDB:
         def list_opencode_sessions(self):
@@ -90,30 +123,101 @@ def test_desired_event_directories_tolerates_db_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bot, "database", _BrokenDB())
 
-    assert bot.desired_event_directories() == {str(config_dir)}
+    assert bot.desired_event_subscriptions() == {
+        ("http://localhost:4096", str(config_dir))
+    }
 
 
 def test_reconcile_event_tasks_adds_and_keeps_existing():
     application = _FakeApplication()
+    subscriptions = {("http://a:1", "x"), ("http://b:2", "y")}
 
-    bot.reconcile_event_tasks(application, {"a", "b"})
-    assert set(application.bot_data["event_tasks"]) == {"a", "b"}
-    assert sorted(application.created) == ["events:a", "events:b"]
+    bot.reconcile_event_tasks(application, subscriptions)
+    assert set(application.bot_data["event_tasks"]) == {
+        "http://a:1::x",
+        "http://b:2::y",
+    }
+    assert sorted(application.created) == [
+        "events:http://a:1::x",
+        "events:http://b:2::y",
+    ]
 
     application.created.clear()
-    bot.reconcile_event_tasks(application, {"a", "b"})
+    bot.reconcile_event_tasks(application, subscriptions)
     assert application.created == []
 
 
 def test_reconcile_event_tasks_cancels_removed():
     application = _FakeApplication()
-    bot.reconcile_event_tasks(application, {"a", "b"})
-    task_a = application.bot_data["event_tasks"]["a"]
+    bot.reconcile_event_tasks(
+        application, {("http://a:1", "x"), ("http://b:2", "y")}
+    )
+    task_a = application.bot_data["event_tasks"]["http://a:1::x"]
 
-    bot.reconcile_event_tasks(application, {"b"})
+    bot.reconcile_event_tasks(application, {("http://b:2", "y")})
 
     assert task_a.cancelled is True
-    assert set(application.bot_data["event_tasks"]) == {"b"}
+    assert set(application.bot_data["event_tasks"]) == {"http://b:2::y"}
+
+
+@pytest.mark.asyncio
+async def test_listen_events_uses_per_base_url_client(monkeypatch):
+    calls: list[str] = []
+
+    def fake_client_for_base_url(context, base_url):
+        calls.append(base_url)
+
+        async def stream_events(directory=None):
+            raise asyncio.CancelledError()
+            yield  # pragma: no cover
+
+        return SimpleNamespace(
+            base_url=base_url, stream_events=stream_events
+        )
+
+    monkeypatch.setattr(handlers, "_client_for_base_url", fake_client_for_base_url)
+    application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
+
+    with pytest.raises(asyncio.CancelledError):
+        await bot._listen_events(application, "http://other:4096", "D:/x")
+
+    assert calls == ["http://other:4096"]
+
+
+def test_build_application_registers_server_command(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", FAKE_TOKEN)
+
+    application = bot.build_application()
+
+    assert any(
+        isinstance(handler, CommandHandler) and "server" in handler.commands
+        for handler in application.handlers[0]
+    )
+
+
+@pytest.mark.parametrize("command", ["skip", "cancel"])
+def test_build_application_registers_server_flow_commands(monkeypatch, command):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", FAKE_TOKEN)
+
+    application = bot.build_application()
+
+    assert any(
+        isinstance(handler, CommandHandler) and command in handler.commands
+        for handler in application.handlers[0]
+    )
+
+
+def test_build_application_registers_server_callback(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", FAKE_TOKEN)
+
+    application = bot.build_application()
+
+    assert any(
+        isinstance(handler, CallbackQueryHandler)
+        and handler.callback is handlers.server_callback
+        for group in application.handlers.values()
+        for handler in group
+    )
 
 
 def _fake_run_app():

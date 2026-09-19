@@ -40,11 +40,14 @@ and voice round trips and interactive permission handling.
 - [x] Live-verified: voice note → `stt.transcribe` → text; text → `tts.synthesize`
       → mp3.
 
-### Phase 2 - Admin-driven user authentication (PENDING)
-- [ ] New users start `is_authenticated = 0`.
-- [ ] Admin receives an authentication request and approves/rejects via inline
-      buttons; decision is persisted in SQLite.
-- [ ] Unauthenticated users are limited to `/start` and `/id`.
+### Phase 2 - Admin-driven user authentication (DONE)
+- [x] New users start `is_authenticated = 0`.
+- [x] Admin receives an authentication request (profile + Approve/Reject inline
+      buttons); decision is persisted in SQLite (`users.approval_requested_at`
+      tracks the pending request, cleared on approval/rejection).
+- [x] Unauthenticated users are limited to `/start` and `/id`; a gate handler in
+      group `-1` replies `ACCESS_PENDING_TEXT` and raises
+      `ApplicationHandlerStop` for everything else.
 
 ### Phase 3 - opencode integration + voice mode (DONE)
 - [x] Root `opencode_client/` async client over the local opencode HTTP API.
@@ -65,7 +68,9 @@ and voice round trips and interactive permission handling.
 
 ### Phase 3.5 - opencode command palette (DONE)
 - [x] `/models` lists connected-provider models as inline buttons and persists
-      the selection (`users.model_provider` / `users.model_id`).
+      the selection **per (user, server)** (`user_models`; the default server
+      mirrors `users.model_provider` / `users.model_id`). Switching servers
+      resets the selection to that server's default until one is chosen.
 - [x] `/session` lists sessions whose directory matches the user's workdir and
       lets the user switch the active session.
 - [x] `/workdir [path]` shows/sets the workdir (validated directory) and starts
@@ -85,6 +90,14 @@ and voice round trips and interactive permission handling.
 - [x] Only authenticated users may browse; `OSError`/permission errors are shown,
       not raised.
 - [x] Tests for the browser helpers and callbacks.
+- [x] **The workdir is a path on the selected opencode server, not the bot host.**
+      Browsing uses the server's `GET /file?path=<abs>&directory=<abs>` listing and
+      the default comes from `GET /path`; local `os.scandir`/`Path` are never used
+      on these paths (the server may be macOS/Linux or Windows). The workdir is
+      stored **per (user, server)** (`user_workdirs`); switching servers never
+      carries a workdir over, and a server with no stored workdir uses that
+      server's default. Stale/invalid stored workdirs are reset to the server
+      default by `ensure_session` and by `/workdir` (no argument).
 
 ### Phase 3.7 - task status command (DONE)
 - [x] `opencode_client.get_session_status()` (`GET /session/status`) and
@@ -258,6 +271,47 @@ tunnel so Telegram pushes updates to `telegram-bot.shivrajan.com`.
       construction, and skip-when-not-configured.
 - [ ] Docs: README webhook section + the `.env` keys.
 
+### Phase 11 - custom opencode servers (DONE)
+Authenticated users can register extra opencode servers and switch between
+them; the default is the configured `OPENCODE_BASE_URL`.
+
+- [x] `servers` table (shared registry) plus `users.server_id` and
+      `opencode_sessions.server_id`; `ensure_default_server` seeds the
+      `OPENCODE_BASE_URL` entry on startup.
+- [x] `/server` (any authenticated user) lists servers as inline buttons
+      (`srv:use:<id>`), marks the active one, and offers `➕ Add server`
+      (`srv:add`) plus admin-only remove buttons (`srv:rm:<id>`).
+      `/server add <url> [label]`, `/server use <id>`, `/server remove <id>`
+      (admin only), and `/server list`.
+- [x] `normalize_server_url` requires an `http`/`https` scheme and a host;
+      adds are health-checked asynchronously (`_check_server`, with the supplied
+      credentials) and rejected (not persisted) when invalid or unreachable.
+- [x] Optional credentials: `servers.username` / `servers.password` (plaintext
+      in the gitignored SQLite DB). `/server add <url> [label]` and `srv:add`
+      start an interactive prompt (URL → username → password; `/skip` to leave a
+      field empty, `/cancel` to abort). A username selects HTTP Basic; a secret
+      with no username selects Bearer. The password message is deleted
+      (best-effort), embedded `user:pass@` URLs are stripped into the
+      credentials, secrets are never logged/echoed and are masked in listings
+      (`🔒 <username>` / `🔒 token`). The client cache is invalidated on
+      add/remove.
+- [x] Per-user active server (`get_user_server`/`set_user_server`); switching
+      to a different server deletes the user's opencode session so a fresh one
+      is created there (mirrors `/workdir`). Removing a server detaches users,
+      drops its sessions, and refuses to delete the last server.
+- [x] `_client(context, server_row)` returns the default client for the
+      configured base URL and otherwise get-or-creates a cached
+      `OpenCodeClient` per base URL (`bot_data["opencode_clients"]`); every
+      prompt/session/status/MCP/compaction/question/permission flow resolves the
+      caller's server.
+- [x] Event streams are keyed by `(base_url, directory)`
+      (`desired_event_subscriptions`, task key `f"{base_url}::{directory}"`);
+      question reconciliation iterates each server in use. Permission replies
+      are routed back to the server that asked.
+- [x] Tests (no network) for the DB accessors, `/server` command + callbacks,
+      pending URL input, multi-server client selection, and event
+      subscriptions.
+
 ## Tech Stack
 
 | Concern        | Choice                                                        |
@@ -351,6 +405,9 @@ await client.list_sessions(*, directory=None) -> list[dict]
 await client.compact_session(session_id) -> None
 await client.get_mcp_status(*, directory=None) -> dict        # {server: {"status": ...}}
 await client.list_tool_ids(*, directory=None) -> list[str]
+await client.get_path(*, directory=None) -> dict              # GET /path (server default dirs)
+await client.list_directory(path, *, directory=None) -> list[dict]  # GET /file
+await client.default_directory(*, directory=None) -> str      # server default, "/" fallback
 
 async for event in client.stream_events():   # parsed SSE events {id, type, properties}
     ...
@@ -368,6 +425,8 @@ Endpoints used (all relative to `OPENCODE_BASE_URL`, `directory` as query param)
 | History            | `GET /session/{id}/message`                      | `[{info,parts}]`                                     |
 | Reply permission   | `POST /permission/{requestID}/reply`             | `{"reply": "once"\|"always"\|"reject"}`             |
 | Events (SSE)       | `GET /event`                                     | `data: {"id","type","properties"}`                   |
+| Server paths       | `GET /path`                                      | `{home, state, config, worktree, directory}`         |
+| List directory     | `GET /file?path=<abs>&directory=<abs>`           | `[{name, path, absolute, type, ignored}]`            |
 
 The assistant text is the concatenation of `parts` where `type == "text"`.
 
@@ -411,9 +470,11 @@ The assistant text is the concatenation of `parts` where `type == "text"`.
 | `is_authenticated` | INTEGER | 0/1, default 0                               |
 | `role`             | TEXT    | `admin` \| `user`, default `user`            |
 | `voice_mode`       | INTEGER | 0/1, default 0 (Phase 3)                     |
-| `workdir`          | TEXT    | nullable; opencode working dir (Phase 3.5)    |
-| `model_provider`   | TEXT    | nullable; selected providerID (Phase 3.5)     |
-| `model_id`         | TEXT    | nullable; selected modelID (Phase 3.5)        |
+| `workdir`          | TEXT    | nullable; legacy/default-server workdir (Phase 3.5) |
+| `model_provider`   | TEXT    | nullable; legacy/default-server selected providerID (Phase 3.5) |
+| `model_id`         | TEXT    | nullable; legacy/default-server selected modelID (Phase 3.5) |
+| `server_id`        | INTEGER | nullable; active `servers.id` (Phase 11)      |
+| `approval_requested_at` | TEXT | nullable; ISO-8601 UTC when the admin was last notified (Phase 2) |
 | `created_at`       | TEXT    | ISO-8601 UTC                                 |
 | `updated_at`       | TEXT    | ISO-8601 UTC                                 |
 
@@ -442,8 +503,52 @@ The assistant text is the concatenation of `parts` where `type == "text"`.
 | `user_id`    | INTEGER | UNIQUE, FK -> users.id                 |
 | `session_id` | TEXT    | opencode session id (`ses_...`)        |
 | `directory`  | TEXT    | working directory for this session     |
+| `server_id`  | INTEGER | nullable; server hosting the session (Phase 11) |
 | `created_at` | TEXT    | ISO-8601 UTC                           |
 | `updated_at` | TEXT    | ISO-8601 UTC                           |
+
+`servers` table (Phase 11; shared registry, default = `OPENCODE_BASE_URL`):
+
+| Column       | Type    | Notes                                  |
+| ------------ | ------- | -------------------------------------- |
+| `id`         | INTEGER | PK, autoincrement                      |
+| `label`      | TEXT    | display label (e.g. `Local`)           |
+| `base_url`   | TEXT    | UNIQUE, normalized (no trailing `/`)   |
+| `created_by` | INTEGER | nullable; adding `users.id`            |
+| `username`   | TEXT    | nullable; Basic auth user (Phase 11)   |
+| `password`   | TEXT    | nullable; Basic password or Bearer secret, plaintext (Phase 11) |
+| `created_at` | TEXT    | ISO-8601 UTC                           |
+
+`user_workdirs` table (Phase 11; per (user, server) workdir):
+
+| Column       | Type    | Notes                                  |
+| ------------ | ------- | -------------------------------------- |
+| `id`         | INTEGER | PK, autoincrement                      |
+| `user_id`    | INTEGER | FK -> users.id                         |
+| `server_id`  | INTEGER | FK -> servers.id                       |
+| `directory`  | TEXT    | NOT NULL; server-side working directory |
+| `updated_at` | TEXT    | ISO-8601 UTC                           |
+
+`UNIQUE(user_id, server_id)`. The default server's row mirrors `users.workdir`
+so legacy readers keep working; `get_workdir(tg, server_id=None)` still reads
+`users.workdir`.
+
+`user_models` table (Phase 11; per (user, server) selected model):
+
+| Column        | Type    | Notes                                   |
+| ------------- | ------- | --------------------------------------- |
+| `id`          | INTEGER | PK, autoincrement                       |
+| `user_id`     | INTEGER | FK -> users.id                          |
+| `server_id`   | INTEGER | FK -> servers.id                        |
+| `provider_id` | TEXT    | NOT NULL; selected providerID           |
+| `model_id`    | TEXT    | NOT NULL; selected modelID              |
+| `updated_at`  | TEXT    | ISO-8601 UTC                            |
+
+`UNIQUE(user_id, server_id)`. The selected model is stored **per (user,
+server)**: switching servers never carries a model over, and an unset server
+uses its default (`None`). The default server's row mirrors
+`users.model_provider` / `users.model_id` so legacy readers keep working;
+`get_model(tg, server_id=None)` still reads the legacy columns.
 
 Admin seed (idempotent, insert-or-ignore then update role):
 
@@ -457,8 +562,14 @@ role            = admin
 ```
 
 Migrations: `init_db()` must add `users.voice_mode`, `users.workdir`,
-`users.model_provider`, and `users.model_id` via `ALTER TABLE ... ADD COLUMN`
-when missing (SQLite has no `IF NOT EXISTS` for columns).
+`users.model_provider`, `users.model_id`, `users.server_id`,
+`users.approval_requested_at`, `opencode_sessions.server_id`, and
+`servers.username` / `servers.password` via `ALTER TABLE ... ADD COLUMN` when
+missing (SQLite has no `IF NOT EXISTS` for columns). The `user_workdirs` table
+is created by `SCHEMA` (no column migration needed); existing `users.workdir`
+values remain the default server's workdir. The `user_models` table is likewise
+created by `SCHEMA`; existing `users.model_provider` / `users.model_id` values
+remain the default server's model.
 
 ## Configuration
 
@@ -497,6 +608,10 @@ MEDIA_MAX_MB=20                # max size for inbound/outbound media bridging
   `OPENCODE_DIRECTORY` falls back to the repo root when empty.
 - Never commit `.env`, tokens, or anything under `data/` or `media/`.
 - `TELEGRAM_BOT_TOKEN` validation is **lazy** (`config.require_telegram_token()`).
+- Custom servers (Phase 11) need no extra keys: `OPENCODE_BASE_URL` is registered
+  as the default server (`Local`) on startup, and users add others with
+  `/server add <url> [label]`. A server in a Docker container reaches the host
+  via `http://host.docker.internal:4096` (or a LAN URL).
 
 ## Bot Commands
 
@@ -518,6 +633,7 @@ MEDIA_MAX_MB=20                # max size for inbound/outbound media bridging
 | `/compact`     | Compact (summarize) the active session.                      |
 | `/mcp`         | List MCP servers, status, and tool ids.                      |
 | `/status`      | Show the status of the ongoing opencode task.                |
+| `/server`      | List/switch opencode servers (buttons); `add <url> [label]`, `use <id>`, `remove <id>` (admin only), `list`. |
 | `/list`, `/get <id>` | Browse stored media (items tappable, or by id).         |
 
 opencode features require `is_authenticated = 1`.

@@ -24,10 +24,17 @@ creates, and approve tool-permission requests with inline buttons.
 - **Interactive permissions** — when opencode asks to run a tool, you get
   Allow once / Always / Reject buttons; your choice resumes the agent.
 - **Model & session pickers** — `/models` and `/session` are inline-button menus.
-- **Directory browser** — `/workdir` lets you browse the filesystem with buttons
-  and pick the working directory for the agent.
+  The selected model is stored **per (user, server)**, so switching servers never
+  carries a model over; an unset model means the server default.
+- **Directory browser** — `/workdir` lets you browse the **opencode server's**
+  filesystem with buttons and pick the working directory for the agent. The
+  workdir is stored **per (user, server)**, so switching servers never carries a
+  path over; a path that is not browsable on the current server is reset to that
+  server's default.
 - **Task status** — `/status` shows the running prompt, elapsed time, the latest
   activity, and the agent's todo list.
+- **Multiple opencode servers** — register extra servers with `/server` and
+  switch between them per user; the configured `OPENCODE_BASE_URL` is the default.
 - **Two-way media store** — every incoming media file is kept under `media/` and
   recorded in SQLite; `/list` and `/get` retrieve them.
 
@@ -87,8 +94,8 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 | `STT_PROVIDER` | `api` | Reserved |
 | `TTS_VOICE` | `en-US-AriaNeural` | Edge TTS voice |
 | `TTS_RATE` / `TTS_VOLUME` / `TTS_PITCH` | `+0%` / `+0%` / `+0Hz` | Edge TTS prosody |
-| `OPENCODE_BASE_URL` | `http://localhost:4096` | opencode server URL (host/port are used to start it) |
-| `OPENCODE_DIRECTORY` | repo root | Default working directory |
+| `OPENCODE_BASE_URL` | `http://localhost:4096` | Default opencode server URL (registered as `Local`; host/port are used to start it) |
+| `OPENCODE_DIRECTORY` | repo root | Default working directory (fallback when the server's `GET /path` is unavailable) |
 | `OPENCODE_AGENT` | `build` | opencode agent to use |
 | `OPENCODE_TIMEOUT` | `600` | Seconds to wait for a blocking prompt |
 | `OPENCODE_SERVE_COMMAND` | `opencode` | Command used to launch `opencode serve` |
@@ -195,14 +202,54 @@ scripts have POSIX counterparts). Prerequisites: Python 3.14+ with a
 | `/voice on` \| `/voice off` | Enable/disable spoken replies |
 | `/models` | Pick the model with **buttons** |
 | `/session` | Pick an existing session with **buttons** |
-| `/workdir` | Browse and set the working directory with **buttons** |
+| `/workdir` | Browse and set the working directory with **buttons** (a path on the selected opencode server) |
 | `/compact` | Compact the current session (fire-and-forget) |
 | `/mcp` | List MCP servers, status, and tool ids |
+| `/server` | List/switch opencode servers (buttons); `add <url> [label]`, `use <id>`, `remove <id>` (admin only), `list` |
 | `/list` | List stored media as tappable **buttons** |
 | `/get <id>` | Send a stored media item by id |
 
 > opencode features require an authenticated user. New users start
 > unauthenticated; the admin is seeded from `ADMIN_USER_ID`.
+
+## User approval
+
+New users start unauthenticated. The first time an unknown user messages the bot,
+the bot forwards an access request to `ADMIN_USER_ID` (name, username, Telegram
+id, language) with **✅ Approve** / **🚫 Reject** inline buttons and replies to the
+user that their access is pending. While unauthenticated, the only commands that
+reach their handlers are `/start` and `/id`; everything else gets the
+access-pending message. Tapping **Approve** sets `is_authenticated = 1` and DMs
+the user; **Reject** keeps them unauthenticated and DMs them that the request was
+declined. The request is sent once per pending state (rejecting clears it, so a
+later message can re-notify the admin).
+
+## Custom opencode servers
+
+The bot talks to `OPENCODE_BASE_URL` (default `http://localhost:4096`), which is
+registered as the default `Local` server at startup. Authenticated users can add
+more servers and switch between them; the choice is per user.
+
+- `/server` lists every registered server as an inline button (the active one is
+  marked `✅`) plus a `➕ Add server` button. Admins also get remove buttons.
+- `/server add <url> [label]` (or the `➕ Add server` button) starts an
+  interactive prompt: URL → username → password. Send `/skip` to leave a field
+  empty and `/cancel` to abort. After the health check the server is added and
+  selected. `/server use <id>` switches to an existing server.
+- **Credentials** are optional. A username selects HTTP **Basic** auth (empty
+  password allowed); a secret with no username selects **Bearer** auth. They are
+  stored in plaintext in the local (gitignored) SQLite database, never logged or
+  echoed, and shown only as `🔒 <username>` / `🔒 token`. The password message is
+  deleted from the chat afterwards. Only add servers you trust.
+- `/server remove <id>` (admin only) detaches users on it and drops its sessions;
+  the last remaining server cannot be removed.
+- Switching to a different server **deletes your current session**, so the next
+  prompt starts a fresh session on the new server.
+
+A server running in Docker reaches the host opencode server via
+`http://host.docker.internal:4096` (or a LAN URL); a plain local server is
+`http://localhost:4096`. Only add servers you trust — the agent can read and
+write files in each server's working directory.
 
 ## How it works
 
@@ -242,17 +289,17 @@ use fakes) and does not require a real bot token.
 | Symptom | Fix |
 | --- | --- |
 | `Sorry, Opencode could not complete that request.` | Check the opencode server is running and the selected model is valid (`/models`); see the bot log for the HTTP status. |
-| Replies never arrive | Ensure `OPENCODE_BASE_URL` points at your running server and `OPENCODE_DIRECTORY` is a real directory. |
+| Replies never arrive | Ensure `OPENCODE_BASE_URL` points at your running server and its default directory (`GET /path`) is valid. |
 | Agent blocks on a permission prompt | Tap the Allow/Reject buttons, or set broader defaults in your opencode config. |
 | Voice input fails | Set `STT_API_KEY` and a valid `STT_MODEL`. |
-| Workdir looks wrong | Run `/workdir` and pick a directory; use an absolute path with a drive letter on Windows. |
+| Workdir looks wrong | Run `/workdir` and pick a directory **on the opencode server** (the browser lists the server's filesystem, not the bot host's); the workdir is stored per (user, server), and a stale/invalid stored workdir is reset to that server's default. |
 
 ## Security notes
 
 - `.env`, `data/`, and `media/` are gitignored. **Never commit them.**
 - Rotate `TELEGRAM_BOT_TOKEN` / `STT_API_KEY` if they are ever exposed.
-- opencode features are restricted to authenticated users (the admin by default).
-  Pair this with Phase 2 approval if you expose the bot to others.
+- opencode features are restricted to authenticated users. New users start
+  unauthenticated and must be approved by the admin (see **User approval**).
 - The bot can read/write files in the configured working directory; run it only
   on machines and directories you trust.
 

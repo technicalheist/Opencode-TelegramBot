@@ -116,14 +116,30 @@ class OpenCodeClient:
         directory: str | Path | None = None,
         timeout: float | None = None,
         *,
+        username: str | None = None,
+        password: str | None = None,
+        token: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = (base_url or config.OPENCODE_BASE_URL).rstrip("/")
-        self._directory = (
-            Path(config.OPENCODE_DIRECTORY) if directory is None else Path(directory)
-        )
+        if directory is None:
+            directory = (
+                config.OPENCODE_DIRECTORY
+                if self._base_url == config.OPENCODE_BASE_URL.rstrip("/")
+                else None
+            )
+        self._directory = Path(directory) if directory is not None else None
         self._timeout = (
             float(config.OPENCODE_TIMEOUT) if timeout is None else float(timeout)
+        )
+        # ``password`` and ``token`` are aliases for the secret; ``token`` is only
+        # consulted when ``password`` is None. Credentials are never logged.
+        secret = password if password is not None else token
+        self._auth = httpx.BasicAuth(username, secret or "") if username else None
+        self._headers = (
+            {"Authorization": f"Bearer {secret}"}
+            if username is None and secret
+            else None
         )
         self._client = client
 
@@ -132,7 +148,7 @@ class OpenCodeClient:
         return self._base_url
 
     @property
-    def directory(self) -> Path:
+    def directory(self) -> Path | None:
         return self._directory
 
     @property
@@ -144,12 +160,17 @@ class OpenCodeClient:
         if self._client is not None:
             yield self._client
         else:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=self._timeout, auth=self._auth, headers=self._headers
+            ) as client:
                 yield client
 
     def _params(self, directory: str | Path | None = None) -> dict[str, str]:
-        target = self._directory if directory is None else Path(directory)
-        return {"directory": str(target)}
+        if directory is None:
+            if self._directory is None:
+                return {}
+            return {"directory": str(self._directory)}
+        return {"directory": str(directory)}
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
@@ -443,6 +464,53 @@ class OpenCodeClient:
                 return part
             return None
         return None
+
+    async def get_path(self, *, directory: str | Path | None = None) -> dict:
+        path = "/path"
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path), params=self._params(directory), timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Path response was not valid JSON.") from exc
+        if not isinstance(body, dict):
+            raise OpenCodeError("Path response was not a JSON object.")
+        return body
+
+    async def list_directory(
+        self, path: str, *, directory: str | Path | None = None
+    ) -> list[dict]:
+        target = "/file"
+        params = {"path": path, "directory": str(directory or path)}
+        async with self._http() as client:
+            response = await client.get(
+                self._url(target), params=params, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", target, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Directory listing response was not valid JSON.") from exc
+        if not isinstance(body, list):
+            raise OpenCodeError("Directory listing response was not a JSON array.")
+        return body
+
+    async def default_directory(self, *, directory: str | Path | None = None) -> str:
+        try:
+            body = await self.get_path(directory=directory)
+        except Exception:
+            logger.warning("Could not resolve the server default directory")
+            return "/"
+        for key in ("directory", "home"):
+            value = body.get(key) if isinstance(body, dict) else None
+            if isinstance(value, str) and value:
+                return value
+        return "/"
 
     async def list_models(self) -> list[dict]:
         providers_path = "/config/providers"

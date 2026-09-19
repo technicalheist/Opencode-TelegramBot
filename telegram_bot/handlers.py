@@ -6,7 +6,10 @@ import hashlib
 import io
 import logging
 import math
+import ntpath
 import os
+import posixpath
+import re
 import sqlite3
 import time
 import urllib.parse
@@ -16,23 +19,33 @@ from typing import Optional
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
-from telegram.ext import ContextTypes
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 import config
 import stt
 import tts
-from opencode_client import OpenCodeError, PermissionRequest
-from telegram_bot import database, storage
+from opencode_client import OpenCodeClient, OpenCodeError, PermissionRequest
+from telegram_bot import database, launcher, storage
 from telegram_bot.formatting import markdown_to_plain, markdown_to_telegram_html
 
 logger = logging.getLogger(__name__)
 
 WORKING_TEXT = "⏳ working…"
 ACCESS_PENDING_TEXT = (
-    "Your access is pending admin approval. "
+    "Your access is pending admin approval. The admin has been notified. "
     "You'll be able to use opencode once an admin authorizes you."
 )
+AUTH_APPROVE_CALLBACK_PREFIX = "auth:ok:"
+AUTH_REJECT_CALLBACK_PREFIX = "auth:no:"
+AUTH_APPROVE_NOTIFY_TEXT = "✅ Approved {telegram_id}"
+AUTH_REJECT_NOTIFY_TEXT = "🚫 Rejected {telegram_id}"
+AUTH_UNKNOWN_USER_TEXT = "⚠️ Unknown user {telegram_id}."
+AUTH_APPROVED_DM_TEXT = (
+    "Your access has been approved. Send /start to begin."
+)
+AUTH_REJECTED_DM_TEXT = "Your access request was declined."
+AUTH_NOT_AUTHORIZED_TEXT = "Not authorized"
 OPENCODE_ERROR_TEXT = "Sorry, opencode could not complete that request."
 UNEXPECTED_ERROR_TEXT = "Something went wrong while contacting opencode."
 EMPTY_REPLY_TEXT = "opencode returned an empty response."
@@ -53,6 +66,55 @@ VOICE_USAGE_TEXT = "Usage: /voice [on|off]"
 MEDIA_CALLBACK_PREFIX = "media:"
 MEDIA_NOT_FOUND_TEXT = "No media with that id."
 
+SERVER_USE_PREFIX = "srv:use:"
+SERVER_ADD_CALLBACK = "srv:add"
+SERVER_REMOVE_PREFIX = "srv:rm:"
+SERVER_USAGE_TEXT = (
+    "Usage: /server [add <url> [label] | use <id> | remove <id> | list]"
+)
+SERVER_SELECT_TEXT = "Select a server:"
+SERVER_NONE_TEXT = "No servers are registered."
+SERVER_INVALID_URL_TEXT = (
+    "That is not a valid server URL. Example: http://localhost:4096"
+)
+SERVER_HEALTH_ERROR_TEXT = (
+    "❌ Cannot reach an opencode server at {url}. Check the URL and that the "
+    "server is running."
+)
+SERVER_ADDED_TEXT = (
+    "Added {label}. A fresh session will start there."
+)
+SERVER_SWITCHED_TEXT = "Switched to {label}. A fresh session will start there."
+SERVER_ALREADY_TEXT = "Already using {label}."
+SERVER_REMOVED_TEXT = "Removed {label}."
+SERVER_LAST_TEXT = "Cannot remove the last remaining server."
+SERVER_NOT_FOUND_TEXT = "No server with that id."
+SERVER_ADMIN_ONLY_TEXT = "That action is admin only."
+SERVER_ADD_PROMPT_TEXT = (
+    "Send the URL of the opencode server (for example http://localhost:4096). "
+    "/cancel to abort."
+)
+SERVER_USERNAME_PROMPT_TEXT = (
+    "Send the username for HTTP Basic auth, or /skip for no username. "
+    "/cancel to abort."
+)
+SERVER_PASSWORD_PROMPT_TEXT = (
+    "Send the password (it will be deleted from this chat), or /skip for an "
+    "empty password. /cancel to abort."
+)
+SERVER_TOKEN_PROMPT_TEXT = (
+    "Send the secret for Bearer auth, or /skip for no authentication. "
+    "/cancel to abort."
+)
+SERVER_CANCELLED_TEXT = "Server setup cancelled."
+SERVER_NOTHING_TO_SKIP_TEXT = "Nothing to skip."
+SERVER_NOTHING_TO_CANCEL_TEXT = "Nothing to cancel."
+SERVER_CREDENTIALS_NONE_TEXT = ""
+SERVER_CREDENTIALS_BASIC_TEXT = " · 🔒 {username}"
+SERVER_CREDENTIALS_TOKEN_TEXT = " · 🔒 token"
+SERVER_SKIP_WORDS = {"skip", "/skip"}
+SERVER_CANCEL_WORDS = {"cancel", "/cancel"}
+
 OUTBOUND_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "svg"}
 OUTBOUND_VIDEO_EXTENSIONS = {"mp4", "mov", "webm", "mkv"}
 OUTBOUND_AUDIO_EXTENSIONS = {"mp3", "wav", "ogg", "m4a", "flac"}
@@ -70,7 +132,6 @@ HTTP_MEDIA_TIMEOUT = 30.0
 NO_MODELS_TEXT = "No connected models are available."
 NO_SESSIONS_TEXT = "No sessions found for this working directory."
 WORKDIR_USAGE_TEXT = "Usage: /workdir <path>"
-WORKDIR_INVALID_TEXT = "That path is not a directory: {path}"
 WORKDIR_SET_TEXT = "Working directory set to {path}. Started a fresh session."
 COMPACT_STARTED_TEXT = "⏳ Session compaction started…"
 COMPACT_DONE_TEXT = "✅ Session compacted."
@@ -131,6 +192,7 @@ HELP_TEXT = (
     "/compact - compact the active session\n"
     "/mcp - list MCP servers, status, and tools\n"
     "/status - show the current task status\n"
+    "/server - add, list, or switch opencode servers\n"
     "/list - list your recent stored media\n"
     "/get <id> - resend a stored media item\n\n"
     "Send text to chat with opencode. Send a voice note or audio file to "
@@ -153,6 +215,8 @@ USER_LOCKS: dict[int, asyncio.Lock] = {}
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 ACTIVE_TASKS: dict[int, dict] = {}
 PENDING_QUESTIONS: dict[int, dict] = {}
+PENDING_SERVER_INPUT: dict[int, dict] = {}
+PERMISSION_SERVERS: dict[str, str] = {}
 
 QUESTION_EXPIRED_TEXT = "This question expired. Please wait for a new prompt."
 QUESTION_SKIPPED_TEXT = "🚫 Question skipped."
@@ -295,6 +359,37 @@ def parse_voice_callback(data: str) -> Optional[bool]:
     return None
 
 
+def build_auth_keyboard(telegram_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Approve",
+                    callback_data=f"{AUTH_APPROVE_CALLBACK_PREFIX}{telegram_id}",
+                ),
+                InlineKeyboardButton(
+                    "🚫 Reject",
+                    callback_data=f"{AUTH_REJECT_CALLBACK_PREFIX}{telegram_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def parse_auth_callback(data: str) -> Optional[tuple[bool, int]]:
+    raw = data or ""
+    for prefix, approved in (
+        (AUTH_APPROVE_CALLBACK_PREFIX, True),
+        (AUTH_REJECT_CALLBACK_PREFIX, False),
+    ):
+        if raw.startswith(prefix):
+            target = raw[len(prefix) :]
+            if target.isdigit():
+                return approved, int(target)
+            return None
+    return None
+
+
 def build_media_keyboard(rows) -> InlineKeyboardMarkup:
     buttons = []
     for row in rows:
@@ -321,73 +416,118 @@ def parse_media_callback(data: str) -> Optional[int]:
     return int(value)
 
 
-def current_directory(user) -> str:
-    stored = database.get_workdir(int(user["telegram_id"]))
+_WINDOWS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _is_windows_path(path: str) -> bool:
+    return bool(_WINDOWS_PATH_RE.match(path or ""))
+
+
+def _path_module(path: str):
+    return ntpath if _is_windows_path(path) else posixpath
+
+
+def _path_name(path: str) -> str:
+    raw = (path or "").rstrip("/\\")
+    if not raw:
+        return path or ""
+    return _path_module(path).basename(raw) or raw
+
+
+def _parent_dir(path: str) -> Optional[str]:
+    raw = path or ""
+    stripped = raw.rstrip("/\\")
+    if not stripped:
+        return None
+    module = _path_module(raw)
+    normalized = module.normpath(stripped)
+    parent = module.dirname(normalized)
+    if not parent or parent == normalized:
+        return None
+    if module is ntpath:
+        if re.fullmatch(r"[A-Za-z]:\\", parent):
+            return parent
+        parent = parent.rstrip("\\")
+    else:
+        if parent == "/":
+            return parent
+        parent = parent.rstrip("/")
+    return parent or None
+
+
+async def list_server_directory(
+    client, path: str
+) -> tuple[list[str], list[str], int]:
+    entries = await client.list_directory(path)
+    children: list[str] = []
+    seen: set[str] = set()
+    files: list[str] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("ignored"):
+            continue
+        entry_type = entry.get("type")
+        if entry_type == "directory":
+            absolute = entry.get("absolute") or entry.get("path")
+            if isinstance(absolute, str) and absolute and absolute not in seen:
+                seen.add(absolute)
+                children.append(absolute)
+        elif entry_type == "file":
+            name = entry.get("name")
+            if isinstance(name, str) and name:
+                files.append(name)
+    children.sort(key=str.casefold)
+    files.sort(key=str.casefold)
+    return children, files, len(files)
+
+
+async def current_directory(user, client, server_id: Optional[int] = None) -> str:
+    stored = database.get_workdir(int(user["telegram_id"]), server_id)
     if stored:
         return stored
-    return str(config.OPENCODE_DIRECTORY)
+    return await client.default_directory()
 
 
-def normalize_workdir(raw: str) -> Optional[str]:
-    candidate = (raw or "").strip()
-    if not candidate:
-        return None
+async def _browsable_workdir(
+    user_row, client, server_id: Optional[int] = None
+) -> str:
+    candidate = await current_directory(user_row, client, server_id)
     try:
-        target = Path(candidate).expanduser().resolve()
-    except OSError:
-        return None
-    if not target.is_absolute() or not target.is_dir():
-        return None
-    return str(target)
-
-
-def list_child_dirs(path: str) -> list[str]:
-    children: list[str] = []
-    with os.scandir(path) as iterator:
-        for entry in iterator:
-            try:
-                if entry.is_dir():
-                    children.append(str(Path(entry.path).resolve()))
-            except OSError:
-                continue
-    return sorted(children, key=lambda child: Path(child).name.casefold())
-
-
-def preview_files(path: str, limit: int = WORKDIR_PREVIEW_LIMIT) -> tuple[list[str], int]:
-    if limit <= 0:
-        return [], 0
-    names: list[str] = []
-    try:
-        with os.scandir(path) as iterator:
-            for entry in iterator:
-                try:
-                    if entry.is_file():
-                        names.append(entry.name)
-                except OSError:
-                    continue
-    except OSError:
-        return [], 0
-    names.sort(key=str.casefold)
-    return names[:limit], len(names)
+        await client.list_directory(candidate)
+    except Exception:
+        default = await client.default_directory()
+        logger.warning(
+            "Stored workdir %r is not browsable; using the server default %r",
+            candidate,
+            default,
+        )
+        database.set_workdir(int(user_row["telegram_id"]), default, server_id)
+        return default
+    return candidate
 
 
 def format_workdir_message(
-    path: str, children: list[str], page: int, *, page_size: int = WORKDIR_PAGE_SIZE
+    path: str,
+    children: list[str],
+    files: list[str],
+    total_files: int,
+    page: int,
+    *,
+    page_size: int = WORKDIR_PAGE_SIZE,
 ) -> str:
     total_pages = max(1, math.ceil(len(children) / page_size))
     page = max(0, min(page, total_pages - 1))
-    file_names, total_files = preview_files(path, WORKDIR_PREVIEW_LIMIT)
+    shown = list(files)[:WORKDIR_PREVIEW_LIMIT]
     lines = [
         f"📂 {path}",
         "",
         f"📁 Subdirectories: {len(children)}",
         f"📄 Files: {total_files}",
     ]
-    if file_names:
+    if shown:
         lines.append("")
-        lines.extend(f"   • {name}" for name in file_names)
-        if total_files > len(file_names):
-            lines.append(f"   … and {total_files - len(file_names)} more")
+        lines.extend(f"   • {name}" for name in shown)
+        if total_files > len(shown):
+            lines.append(f"   … and {total_files - len(shown)} more")
     lines.append("")
     lines.append(f"Page {page + 1}/{total_pages}")
     return "\n".join(lines)
@@ -407,7 +547,7 @@ def build_workdir_keyboard(
         [InlineKeyboardButton(WORKDIR_USE_LABEL, callback_data=WORKDIR_USE_CALLBACK)]
     ]
     for index in range(start, min(start + page_size, len(children))):
-        label = Path(children[index]).name or children[index]
+        label = _path_name(children[index])
         rows.append(
             [
                 InlineKeyboardButton(
@@ -539,8 +679,10 @@ def _current_question(state: dict) -> dict:
     return {}
 
 
-def model_payload(telegram_id: int) -> Optional[dict]:
-    selected = database.get_model(telegram_id)
+def model_payload(
+    telegram_id: int, server_id: Optional[int] = None
+) -> Optional[dict]:
+    selected = database.get_model(telegram_id, server_id)
     if selected is None:
         return None
     provider_id, model_id = selected
@@ -639,8 +781,163 @@ def parse_session_callback(data: str) -> Optional[str]:
     return None
 
 
-def _client(context: ContextTypes.DEFAULT_TYPE):
-    return context.bot_data["opencode"]
+def _normalize_base_url(value) -> str:
+    return str(value or "").rstrip("/")
+
+
+def _server_credentials(base_url: str) -> tuple[Optional[str], Optional[str]]:
+    try:
+        row = database.get_server_by_url(base_url)
+    except Exception:
+        return None, None
+    if row is None:
+        return None, None
+    return _row_get(row, "username"), _row_get(row, "password")
+
+
+def _client_for_base_url(context, base_url: str):
+    default = context.bot_data["opencode"]
+    target = _normalize_base_url(base_url)
+    default_url = _normalize_base_url(getattr(default, "base_url", ""))
+    if not target or target == default_url:
+        return default
+    registry = context.bot_data.setdefault("opencode_clients", {})
+    client = registry.get(target)
+    if client is None:
+        username, password = _server_credentials(target)
+        client = OpenCodeClient(
+            base_url=target, username=username, password=password
+        )
+        registry[target] = client
+    return client
+
+
+def _client(context: ContextTypes.DEFAULT_TYPE, server_row=None):
+    if server_row is None:
+        return context.bot_data["opencode"]
+    return _client_for_base_url(context, _row_get(server_row, "base_url", ""))
+
+
+def _server_id_for_client(client) -> Optional[int]:
+    base_url = _normalize_base_url(getattr(client, "base_url", ""))
+    if not base_url:
+        return None
+    row = database.get_server_by_url(base_url)
+    return int(row["id"]) if row is not None else None
+
+
+def _user_server(telegram_id: int):
+    return database.get_user_server(telegram_id)
+
+
+def normalize_server_url(raw: str) -> Optional[str]:
+    candidate = (raw or "").strip()
+    if not candidate or any(character.isspace() for character in candidate):
+        return None
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return candidate.rstrip("/")
+
+
+def parse_server_url_with_credentials(
+    raw: str,
+) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    """Return ``(url, username, password)`` with any embedded credentials removed.
+
+    ``http://user:pass@host:4096`` yields the clean URL plus the decoded
+    credentials; URLs without credentials return ``(url, None, None)``.
+    """
+    candidate = (raw or "").strip()
+    if not candidate or any(character.isspace() for character in candidate):
+        return None
+    parsed = urllib.parse.urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if not parsed.username and parsed.password is None:
+        return candidate.rstrip("/"), None, None
+    username = urllib.parse.unquote(parsed.username) if parsed.username else None
+    password = (
+        urllib.parse.unquote(parsed.password) if parsed.password is not None else None
+    )
+    host = parsed.hostname or ""
+    netloc = f"{host}:{parsed.port}" if parsed.port else host
+    clean = urllib.parse.urlunparse(
+        (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )
+    return clean.rstrip("/"), username or None, password
+
+
+def _server_host(base_url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(base_url or "")
+    except ValueError:
+        return base_url or ""
+    return parsed.netloc or (base_url or "")
+
+
+def server_credentials_label(server_row) -> str:
+    username = _row_get(server_row, "username")
+    password = _row_get(server_row, "password")
+    if username:
+        return SERVER_CREDENTIALS_BASIC_TEXT.format(username=username)
+    if password:
+        return SERVER_CREDENTIALS_TOKEN_TEXT
+    return SERVER_CREDENTIALS_NONE_TEXT
+
+
+def server_label(server_row) -> str:
+    label = str(_row_get(server_row, "label", "") or "")
+    host = _server_host(str(_row_get(server_row, "base_url", "") or ""))
+    base = f"{label} · {host}" if label else host
+    return f"{base}{server_credentials_label(server_row)}"
+
+
+def build_servers_keyboard(
+    servers, active_id: Optional[int], *, is_admin: bool = False
+) -> InlineKeyboardMarkup:
+    buttons = []
+    for server in servers:
+        server_id = int(server["id"])
+        prefix = "✅ " if server_id == active_id else ""
+        buttons.append(
+            InlineKeyboardButton(
+                f"{prefix}{server_label(server)}"[:60],
+                callback_data=f"{SERVER_USE_PREFIX}{server_id}",
+            )
+        )
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.append(
+        [InlineKeyboardButton("➕ Add server", callback_data=SERVER_ADD_CALLBACK)]
+    )
+    if is_admin:
+        remove = [
+            InlineKeyboardButton(
+                f"🗑️ {server_label(server)}"[:60],
+                callback_data=f"{SERVER_REMOVE_PREFIX}{int(server['id'])}",
+            )
+            for server in servers
+        ]
+        rows.extend(remove[index : index + 2] for index in range(0, len(remove), 2))
+    return InlineKeyboardMarkup(rows)
+
+
+def _servers_message(row, *, prefix: Optional[str] = None) -> tuple[str, InlineKeyboardMarkup]:
+    telegram_id = int(row["telegram_id"])
+    servers = database.list_servers()
+    active = _user_server(telegram_id)
+    active_id = int(active["id"]) if active is not None else None
+    lines: list[str] = []
+    if prefix:
+        lines.append(prefix)
+        lines.append("")
+    lines.append(SERVER_SELECT_TEXT)
+    if active is not None:
+        lines.append(f"Active: {server_label(active)}")
+    keyboard = build_servers_keyboard(
+        servers, active_id, is_admin=(telegram_id == config.ADMIN_USER_ID)
+    )
+    return "\n".join(lines), keyboard
 
 
 def request_event_refresh(context) -> None:
@@ -679,22 +976,182 @@ async def _require_authenticated(update: Update) -> Optional[sqlite3.Row]:
     return row
 
 
+def _row_get(row, key: str, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def _command_from_message(update: Update) -> str:
+    message = update.effective_message
+    text = (getattr(message, "text", None) or "").strip()
+    if not text:
+        return ""
+    return text.split()[0].split("@", 1)[0].lower()
+
+
+async def notify_admin_new_user(context: ContextTypes.DEFAULT_TYPE, user_row) -> None:
+    telegram_id = int(user_row["telegram_id"])
+    if telegram_id == config.ADMIN_USER_ID:
+        return
+    if bool(_row_get(user_row, "is_authenticated", 0)):
+        return
+    if _row_get(user_row, "approval_requested_at"):
+        return
+    name = " ".join(
+        part for part in (user_row["first_name"], user_row["last_name"]) if part
+    ) or "(no name)"
+    username = f"@{user_row['username']}" if user_row["username"] else "-"
+    language = user_row["language_code"] or "-"
+    text = (
+        "New access request:\n"
+        f"Name: {name}\n"
+        f"Username: {username}\n"
+        f"Telegram id: {telegram_id}\n"
+        f"Language: {language}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=config.ADMIN_USER_ID,
+            text=text,
+            reply_markup=build_auth_keyboard(telegram_id),
+        )
+    except (Forbidden, BadRequest):
+        logger.warning(
+            "Could not notify admin about user %s (has the admin started the bot?)",
+            telegram_id,
+        )
+        return
+    except Exception:
+        logger.exception("Failed to notify admin about user %s", telegram_id)
+        return
+    database.set_approval_requested(telegram_id, True)
+
+
+async def request_access(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, user_row=None
+) -> None:
+    if user_row is None:
+        user_row = _ensure_user_row(update)
+    await notify_admin_new_user(context, user_row)
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(ACCESS_PENDING_TEXT)
+
+
+async def guard_unauthenticated(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    telegram_user = update.effective_user
+    if telegram_user is None:
+        return
+    # A command cancels any pending "/server add" prompt. Plain text is left
+    # alone so it can still be consumed as the next step; pending free-text
+    # question answers take precedence over the server flow (see text_message).
+    # /skip and /cancel are part of the flow and must not abort it here.
+    text = (getattr(update.effective_message, "text", None) or "").strip()
+    if text.startswith("/"):
+        command = _command_from_message(update)
+        if command not in {"/skip", "/cancel"}:
+            PENDING_SERVER_INPUT.pop(telegram_user.id, None)
+    if telegram_user.id == config.ADMIN_USER_ID:
+        return
+    user_row = _ensure_user_row(update)
+    if bool(_row_get(user_row, "is_authenticated", 0)):
+        return
+    await notify_admin_new_user(context, user_row)
+    if _command_from_message(update) in {"/start", "/id"}:
+        return
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(ACCESS_PENDING_TEXT)
+    raise ApplicationHandlerStop
+
+
+async def auth_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    if not admin_only(update):
+        await query.answer(AUTH_NOT_AUTHORIZED_TEXT, show_alert=True)
+        return
+    parsed = parse_auth_callback(query.data or "")
+    if parsed is None:
+        return
+    approved, target = parsed
+    if database.get_user_by_telegram_id(target) is None:
+        logger.warning("Auth decision for unknown user %s", target)
+        await query.answer(
+            AUTH_UNKNOWN_USER_TEXT.format(telegram_id=target), show_alert=True
+        )
+        try:
+            await query.edit_message_text(
+                AUTH_UNKNOWN_USER_TEXT.format(telegram_id=target)
+            )
+        except Exception:
+            logger.warning("Could not edit auth message", exc_info=True)
+        return
+    if approved:
+        database.set_authenticated(target, True)
+        database.set_approval_requested(target, False)
+        status = AUTH_APPROVE_NOTIFY_TEXT.format(telegram_id=target)
+        dm_text = AUTH_APPROVED_DM_TEXT
+    else:
+        database.set_authenticated(target, False)
+        database.set_approval_requested(target, False)
+        status = AUTH_REJECT_NOTIFY_TEXT.format(telegram_id=target)
+        dm_text = AUTH_REJECTED_DM_TEXT
+    try:
+        await query.edit_message_text(status, reply_markup=None)
+    except Exception:
+        logger.warning("Could not edit auth message", exc_info=True)
+    try:
+        await context.bot.send_message(chat_id=target, text=dm_text)
+    except Exception:
+        logger.warning("Could not DM user %s about the decision", target, exc_info=True)
+
+
 async def ensure_session(
     user_row: sqlite3.Row,
     client,
     *,
     directory: Optional[str] = None,
     model: Optional[dict] = None,
+    server_id: Optional[int] = None,
     context=None,
 ) -> str:
-    existing = database.get_opencode_session(int(user_row["id"]))
+    telegram_id = int(user_row["telegram_id"])
+    user_id = int(user_row["id"])
+    target_directory = directory or await client.default_directory()
+    try:
+        await client.list_directory(target_directory)
+    except Exception:
+        healed = await client.default_directory()
+        logger.warning(
+            "Workdir %r is not browsable on the server; using %r instead",
+            target_directory,
+            healed,
+        )
+        target_directory = healed
+        database.set_workdir(telegram_id, healed, server_id)
+    existing = database.get_opencode_session(user_id)
     if existing is not None:
-        return str(existing["session_id"])
-    target_directory = directory or str(
-        getattr(client, "directory", config.OPENCODE_DIRECTORY)
-    )
+        existing_server_id = _row_get(existing, "server_id")
+        same_server = server_id is None or existing_server_id == server_id
+        same_directory = str(existing["directory"]) == target_directory
+        if same_server and same_directory:
+            return str(existing["session_id"])
+        logger.info(
+            "Stored session for user %s does not match server %s / directory %s; recreating",
+            telegram_id,
+            server_id,
+            target_directory,
+        )
+        database.delete_opencode_session(user_id)
     session = await client.create_session(
-        title=f"Telegram {user_row['telegram_id']}",
+        title=f"Telegram {telegram_id}",
         agent=config.OPENCODE_AGENT,
         model=model,
         directory=target_directory,
@@ -703,7 +1160,10 @@ async def ensure_session(
     if not session_id:
         raise OpenCodeError("opencode did not return a session id.")
     database.set_opencode_session(
-        int(user_row["id"]), str(session_id), target_directory
+        user_id,
+        str(session_id),
+        target_directory,
+        server_id if server_id is not None else _server_id_for_client(client),
     )
     if context is not None:
         request_event_refresh(context)
@@ -987,11 +1447,13 @@ async def _process_prompt(
 ) -> None:
     message = update.effective_message
     telegram_id = int(user_row["telegram_id"])
-    client = _client(context)
     lock = _lock_for(telegram_id)
-    directory = current_directory(user_row)
-    model = model_payload(telegram_id)
     async with lock:
+        server_row = _user_server(telegram_id)
+        client = _client(context, server_row)
+        server_id = int(server_row["id"]) if server_row is not None else None
+        model = model_payload(telegram_id, server_id)
+        directory = await current_directory(user_row, client, server_id)
         placeholder = None
         try:
             session_id = await ensure_session(
@@ -999,8 +1461,12 @@ async def _process_prompt(
                 client,
                 directory=directory,
                 model=model,
+                server_id=server_id,
                 context=context,
             )
+            session_row = database.get_opencode_session(int(user_row["id"]))
+            if session_row is not None and session_row["directory"]:
+                directory = str(session_row["directory"])
             placeholder = await message.reply_text(WORKING_TEXT)
             mark_task_started(telegram_id, session_id, prompt)
             try:
@@ -1092,8 +1558,10 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = " ".join(part for part in (row["first_name"], row["last_name"]) if part)
     username = f"@{row['username']}" if row["username"] else "-"
     telegram_id = int(row["telegram_id"])
-    workdir = database.get_workdir(telegram_id) or str(config.OPENCODE_DIRECTORY)
-    selected_model = database.get_model(telegram_id)
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    workdir = database.get_workdir(telegram_id, server_id) or "-"
+    selected_model = database.get_model(telegram_id, server_id)
     model_label = (
         f"{selected_model[0]}/{selected_model[1]}" if selected_model else "default"
     )
@@ -1177,7 +1645,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if session is None:
         await update.effective_message.reply_text(NO_SESSION_TEXT)
         return
-    client = _client(context)
+    client = _client(context, _user_server(int(row["telegram_id"])))
     try:
         await client.abort(str(session["session_id"]))
     except OpenCodeError:
@@ -1207,7 +1675,8 @@ async def _build_status_text(
     session = database.get_opencode_session(int(row["id"]))
     if session is None:
         return STATUS_NONE_TEXT
-    client = _client(context)
+    server_row = _user_server(telegram_id)
+    client = _client(context, server_row)
     status = await client.get_session_status()
     entry = status.get(str(session["session_id"])) if isinstance(status, dict) else None
     status_type = (
@@ -1216,6 +1685,8 @@ async def _build_status_text(
     task = current_task(telegram_id)
     if status_type not in {"busy", "retry"} and task is None:
         return STATUS_NONE_TEXT
+    server_id = int(server_row["id"]) if server_row is not None else None
+    directory = await current_directory(row, client, server_id)
     lines = [
         f"⏳ Ongoing task — session {session['session_id']}",
         f"Status: {_format_status_line(status_type, entry, task)}",
@@ -1232,7 +1703,7 @@ async def _build_status_text(
         lines.append(f"Prompt: {prompt}")
     try:
         activity_part = await client.get_last_activity(
-            str(session["session_id"]), directory=current_directory(row)
+            str(session["session_id"]), directory=directory
         )
     except Exception:
         logger.exception(
@@ -1244,7 +1715,7 @@ async def _build_status_text(
         lines.append(f"Activity: {activity}")
     try:
         todos = await client.get_session_todos(
-            str(session["session_id"]), directory=current_directory(row)
+            str(session["session_id"]), directory=directory
         )
     except Exception:
         logger.exception("Failed to fetch todos for session %s", session["session_id"])
@@ -1296,7 +1767,7 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if row is None:
         return
     telegram_id = int(row["telegram_id"])
-    client = _client(context)
+    client = _client(context, _user_server(telegram_id))
     try:
         models = await client.list_models()
     except OpenCodeError:
@@ -1317,8 +1788,10 @@ async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if row is None:
         return
     telegram_id = int(row["telegram_id"])
-    directory = current_directory(row)
-    client = _client(context)
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    client = _client(context, server_row)
+    directory = await current_directory(row, client, server_id)
     try:
         sessions = await client.list_sessions(directory=directory, limit=50)
     except OpenCodeError:
@@ -1338,13 +1811,20 @@ async def _apply_workdir(
 ) -> Optional[str]:
     telegram_id = int(row["telegram_id"])
     user_id = int(row["id"])
-    database.set_workdir(telegram_id, directory)
-    client = _client(context)
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    client = _client(context, server_row)
+    try:
+        await client.list_directory(directory)
+    except Exception:
+        logger.exception("Workdir %s is not browsable on the server", directory)
+        return WORKDIR_BROWSE_ERROR_TEXT.format(path=directory)
+    database.set_workdir(telegram_id, directory, server_id)
     try:
         session = await client.create_session(
             title=f"Telegram {telegram_id}",
             agent=config.OPENCODE_AGENT,
-            model=model_payload(telegram_id),
+            model=model_payload(telegram_id, server_id),
             directory=directory,
         )
     except OpenCodeError:
@@ -1356,18 +1836,33 @@ async def _apply_workdir(
     session_id = session.get("id") if isinstance(session, dict) else None
     if not session_id:
         return OPENCODE_ERROR_TEXT
-    database.set_opencode_session(user_id, str(session_id), directory)
+    database.set_opencode_session(
+        user_id, str(session_id), directory, _server_id_for_client(client)
+    )
     request_event_refresh(context)
     return None
 
 
 async def _open_browser(
-    target, telegram_id: int, path: str, page: int = 0, *, edit: bool = False
+    context: ContextTypes.DEFAULT_TYPE,
+    target,
+    telegram_id: int,
+    path: str,
+    page: int = 0,
+    *,
+    edit: bool = False,
+    base_url: Optional[str] = None,
 ) -> None:
+    client = _client_for_base_url(
+        context, base_url or config.OPENCODE_BASE_URL
+    )
+    resolved_base = _normalize_base_url(getattr(client, "base_url", "")) or _normalize_base_url(
+        base_url or config.OPENCODE_BASE_URL
+    )
     try:
-        children = list_child_dirs(path)
-    except OSError:
-        logger.exception("Could not browse directory %s", path)
+        children, files, total_files = await list_server_directory(client, path)
+    except Exception:
+        logger.exception("Could not browse server directory %s", path)
         text = WORKDIR_BROWSE_ERROR_TEXT.format(path=path)
         if edit:
             try:
@@ -1381,13 +1876,16 @@ async def _open_browser(
     page = max(0, min(page, total_pages - 1))
     WORKDIR_BROWSE[telegram_id] = {
         "owner": telegram_id,
+        "base_url": resolved_base,
         "path": path,
         "page": page,
         "children": children,
+        "files": files,
+        "total_files": total_files,
     }
-    text = format_workdir_message(path, children, page)
+    text = format_workdir_message(path, children, files, total_files, page)
     keyboard = build_workdir_keyboard(
-        children, page, has_parent=Path(path).parent != Path(path)
+        children, page, has_parent=_parent_dir(path) is not None
     )
     if edit:
         await target.edit_message_text(text, reply_markup=keyboard)
@@ -1401,22 +1899,21 @@ async def workdir_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     message = update.effective_message
     telegram_id = int(row["telegram_id"])
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    client = _client(context, server_row)
+    base_url = _normalize_base_url(getattr(client, "base_url", ""))
     if not context.args:
-        await _open_browser(message, telegram_id, current_directory(row), 0)
+        directory = await _browsable_workdir(row, client, server_id)
+        await _open_browser(
+            context, message, telegram_id, directory, 0, base_url=base_url
+        )
         return
     raw = " ".join(context.args).strip()
     if not raw:
         await message.reply_text(WORKDIR_USAGE_TEXT)
         return
-    directory = normalize_workdir(raw)
-    if directory is None:
-        try:
-            attempted = str(Path(raw).expanduser().resolve())
-        except OSError:
-            attempted = raw
-        await message.reply_text(WORKDIR_INVALID_TEXT.format(path=attempted))
-        return
-    await _open_browser(message, telegram_id, directory, 0)
+    await _open_browser(context, message, telegram_id, raw, 0, base_url=base_url)
 
 
 async def _edit_browser_error(query, text: str) -> None:
@@ -1455,6 +1952,7 @@ async def workdir_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     path = str(state.get("path") or "")
     page = int(state.get("page") or 0)
     children = list(state.get("children") or [])
+    base_url = state.get("base_url")
     try:
         if action == "use":
             await query.answer()
@@ -1471,26 +1969,41 @@ async def workdir_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.answer(WORKDIR_DIR_GONE_TEXT, show_alert=True)
                 return
             await query.answer()
-            await _open_browser(query, telegram_id, children[index], 0, edit=True)
+            await _open_browser(
+                context, query, telegram_id, children[index], 0, edit=True,
+                base_url=base_url,
+            )
             return
         if action == "up":
-            parent = Path(path).parent
-            if parent == Path(path):
+            parent = _parent_dir(path)
+            if parent is None:
                 await query.answer(WORKDIR_ROOT_TEXT, show_alert=True)
                 return
             await query.answer()
-            await _open_browser(query, telegram_id, str(parent), 0, edit=True)
+            await _open_browser(
+                context, query, telegram_id, parent, 0, edit=True, base_url=base_url
+            )
             return
         if action == "pg":
             await query.answer()
             new_page = int(arg) if arg is not None else 0
-            await _open_browser(query, telegram_id, path, new_page, edit=True)
+            await _open_browser(
+                context, query, telegram_id, path, new_page, edit=True,
+                base_url=base_url,
+            )
             return
         if action == "refresh":
             await query.answer()
-            await _open_browser(query, telegram_id, path, page, edit=True)
+            await _open_browser(
+                context, query, telegram_id, path, page, edit=True, base_url=base_url
+            )
             return
-    except OSError:
+    except OpenCodeError:
+        logger.exception("Workdir browse failed at %s", path)
+        await _edit_browser_error(
+            query, WORKDIR_BROWSE_ERROR_TEXT.format(path=path)
+        )
+    except Exception:
         logger.exception("Workdir browse failed at %s", path)
         await _edit_browser_error(
             query, WORKDIR_BROWSE_ERROR_TEXT.format(path=path)
@@ -1518,10 +2031,11 @@ async def _run_compaction(
     session_id: str,
     chat_id: int,
     model: Optional[dict],
+    server_row=None,
 ) -> None:
     try:
         await asyncio.wait_for(
-            _client(context).compact_session(session_id, model=model),
+            _client(context, server_row).compact_session(session_id, model=model),
             timeout=config.OPENCODE_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -1567,6 +2081,8 @@ async def compact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.effective_message.reply_text(NO_SESSION_TEXT)
         return
     telegram_id = int(row["telegram_id"])
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
     await update.effective_message.reply_text(COMPACT_STARTED_TEXT)
     _schedule_background(
         context,
@@ -1574,7 +2090,8 @@ async def compact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             context,
             str(session["session_id"]),
             telegram_id,
-            model_payload(telegram_id),
+            model_payload(telegram_id, server_id),
+            server_row,
         ),
     )
 
@@ -1584,8 +2101,10 @@ async def mcp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if row is None:
         return
     telegram_id = int(row["telegram_id"])
-    directory = current_directory(row)
-    client = _client(context)
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    client = _client(context, server_row)
+    directory = await current_directory(row, client, server_id)
     try:
         servers = await client.get_mcp_status(directory=directory)
         tools = await client.list_tool_ids(directory=directory)
@@ -1877,7 +2396,9 @@ async def _show_current_question(bot, telegram_id: int, *, edit: bool = False) -
         logger.exception("Could not send question message")
 
 
-async def present_question(bot, user_row, request, *, directory=None) -> None:
+async def present_question(
+    bot, user_row, request, *, directory=None, base_url=None
+) -> None:
     questions = request.get("questions") if isinstance(request, dict) else None
     if not questions:
         return
@@ -1888,12 +2409,15 @@ async def present_question(bot, user_row, request, *, directory=None) -> None:
         existing["questions"] = list(questions)
         if directory:
             existing["directory"] = directory
+        if base_url:
+            existing["base_url"] = base_url
         await _show_current_question(bot, telegram_id, edit=True)
         return
     PENDING_QUESTIONS[telegram_id] = {
         "request_id": request_id,
         "session_id": str(request.get("sessionID") or ""),
         "directory": directory,
+        "base_url": base_url,
         "questions": list(questions),
         "index": 0,
         "answers": [],
@@ -1915,7 +2439,9 @@ async def _record_answer(
     if state["index"] < len(state.get("questions") or []):
         await _show_current_question(context.bot, telegram_id, edit=True)
         return
-    client = _client(context)
+    client = _client_for_base_url(
+        context, state.get("base_url") or config.OPENCODE_BASE_URL
+    )
     directory = state.get("directory") or None
     try:
         if directory:
@@ -1957,7 +2483,9 @@ async def question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     action, qidx, oidx = parsed
     if action == "r":
-        client = _client(context)
+        client = _client_for_base_url(
+            context, state.get("base_url") or config.OPENCODE_BASE_URL
+        )
         directory = state.get("directory") or None
         try:
             if directory:
@@ -2038,37 +2566,55 @@ def _clear_question_state(session_id: str, request_id: str) -> None:
 
 
 async def reconcile_questions(application) -> None:
-    client = application.bot_data.get("opencode")
-    if client is None:
+    if application.bot_data.get("opencode") is None:
         return
     try:
         sessions = database.list_opencode_sessions()
     except Exception:
         logger.exception("Could not list sessions for question reconciliation")
         return
+    default_base = _normalize_base_url(config.OPENCODE_BASE_URL)
+    by_base: dict[str, list] = {}
     for row in sessions:
-        try:
-            if not bool(row["is_authenticated"]):
-                continue
-            questions = await client.list_questions(directory=row["directory"])
-        except Exception:
-            logger.exception(
-                "Could not list questions for session %s", row["session_id"]
-            )
+        if not bool(row["is_authenticated"]):
             continue
-        for request in questions or []:
-            if not isinstance(request, dict):
-                continue
-            if str(request.get("sessionID") or "") != str(row["session_id"]):
-                continue
+        base = _normalize_base_url(_row_get(row, "base_url") or default_base)
+        by_base.setdefault(base, []).append(row)
+    for base, rows in by_base.items():
+        client = _client_for_base_url(application, base)
+        session_ids = {str(row["session_id"]) for row in rows}
+        directories = {str(row["directory"]) for row in rows if row["directory"]}
+        for directory in directories:
             try:
-                await present_question(
-                    application.bot, row, request, directory=row["directory"]
-                )
+                questions = await client.list_questions(directory=directory)
             except Exception:
                 logger.exception(
-                    "Could not present pending question %s", request.get("id")
+                    "Could not list questions for %s (%s)", base, directory
                 )
+                continue
+            for request in questions or []:
+                if not isinstance(request, dict):
+                    continue
+                session_id = str(request.get("sessionID") or "")
+                if session_id not in session_ids:
+                    continue
+                target = next(
+                    (r for r in rows if str(r["session_id"]) == session_id), None
+                )
+                if target is None:
+                    continue
+                try:
+                    await present_question(
+                        application.bot,
+                        target,
+                        request,
+                        directory=directory,
+                        base_url=base,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not present pending question %s", request.get("id")
+                    )
 
 
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2080,9 +2626,13 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not text:
         return
     telegram_id = int(user_row["telegram_id"])
+    # A pending free-text question answer wins over a pending "/server add" URL.
     state = PENDING_QUESTIONS.get(telegram_id)
     if state is not None:
         await _record_answer(context, telegram_id, state, [text])
+        return
+    if telegram_id in PENDING_SERVER_INPUT:
+        await _handle_server_input(update, context, user_row, text)
         return
     await _process_prompt(update, context, user_row, text)
 
@@ -2098,13 +2648,16 @@ async def permission_callback(
         await query.answer()
         return
     reply, request_id = parsed
-    client = _client(context)
+    client = _client_for_base_url(
+        context, PERMISSION_SERVERS.get(request_id) or config.OPENCODE_BASE_URL
+    )
     try:
         await client.reply_permission(request_id, reply)
     except Exception:
         logger.exception("Failed to reply to permission %s", request_id)
         await query.answer("Could not send that decision.", show_alert=True)
         return
+    PERMISSION_SERVERS.pop(request_id, None)
     await query.answer()
     original = getattr(getattr(query, "message", None), "text", None) or "Permission request"
     try:
@@ -2146,7 +2699,9 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     provider_id, model_id = selected
-    database.set_model(telegram_id, provider_id, model_id)
+    server_row = _user_server(telegram_id)
+    server_id = int(server_row["id"]) if server_row is not None else None
+    database.set_model(telegram_id, provider_id, model_id, server_id)
     await query.answer()
     try:
         await query.edit_message_text(
@@ -2183,7 +2738,15 @@ async def session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             logger.warning("Could not confirm new session", exc_info=True)
         return
-    database.set_opencode_session(user_id, value, current_directory(row))
+    server_row = _user_server(int(row["telegram_id"]))
+    server_id = int(server_row["id"]) if server_row is not None else None
+    client = _client(context, server_row)
+    database.set_opencode_session(
+        user_id,
+        value,
+        await current_directory(row, client, server_id),
+        server_id,
+    )
     await query.answer()
     try:
         await query.edit_message_text(
@@ -2191,6 +2754,391 @@ async def session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
     except Exception:
         logger.warning("Could not confirm session switch", exc_info=True)
+
+
+def _default_server_label(url: str) -> str:
+    return _server_host(url) or "Server"
+
+
+async def _show_servers(update: Update, context, row) -> None:
+    servers = database.list_servers()
+    message = update.effective_message
+    if not servers:
+        await message.reply_text(SERVER_NONE_TEXT)
+        return
+    telegram_id = int(row["telegram_id"])
+    active = _user_server(telegram_id)
+    active_id = int(active["id"]) if active is not None else None
+    lines = [SERVER_SELECT_TEXT]
+    if active is not None:
+        lines.append(f"Active: {server_label(active)}")
+    keyboard = build_servers_keyboard(
+        servers, active_id, is_admin=(telegram_id == config.ADMIN_USER_ID)
+    )
+    await message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+
+async def _switch_server(context, row, server_id: int) -> bool:
+    telegram_id = int(row["telegram_id"])
+    current = _user_server(telegram_id)
+    current_id = int(current["id"]) if current is not None else None
+    if current_id == server_id:
+        return False
+    database.set_user_server(telegram_id, server_id)
+    database.delete_opencode_session(int(row["id"]))
+    request_event_refresh(context)
+    return True
+
+
+def _invalidate_client_cache(context, base_url: str) -> None:
+    bot_data = getattr(context, "bot_data", None)
+    if not bot_data:
+        return
+    registry = bot_data.get("opencode_clients")
+    if not registry:
+        return
+    registry.pop(_normalize_base_url(base_url), None)
+
+
+async def _check_server(
+    base_url: str, username: Optional[str], password: Optional[str]
+) -> bool:
+    client = OpenCodeClient(
+        base_url=base_url, username=username, password=password, timeout=5.0
+    )
+    try:
+        return await client.health()
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            logger.warning("Could not close temporary server client", exc_info=True)
+
+
+async def _finalize_server_add(update: Update, context, row, state: dict) -> None:
+    telegram_id = int(row["telegram_id"])
+    message = update.effective_message
+    url = str(state.get("base_url") or "")
+    label = state.get("label")
+    username = state.get("username")
+    password = state.get("password")
+    try:
+        healthy = await _check_server(url, username, password)
+    except Exception:
+        logger.exception(
+            "Server health check failed for %s (credentials: %s)",
+            _server_host(url),
+            "present" if (username or password) else "none",
+        )
+        healthy = False
+    if not healthy:
+        PENDING_SERVER_INPUT.pop(telegram_id, None)
+        await message.reply_text(SERVER_HEALTH_ERROR_TEXT.format(url=url))
+        return
+    resolved_label = (label or "").strip() or _default_server_label(url)
+    created = database.add_server(
+        resolved_label,
+        url,
+        created_by=int(row["id"]),
+        username=username,
+        password=password,
+    )
+    PENDING_SERVER_INPUT.pop(telegram_id, None)
+    if created is None:
+        existing = database.get_server_by_url(url)
+        if existing is None:
+            await message.reply_text(SERVER_INVALID_URL_TEXT)
+            return
+        _invalidate_client_cache(context, url)
+        switched = await _switch_server(context, row, int(existing["id"]))
+        text = (
+            SERVER_SWITCHED_TEXT.format(label=server_label(existing))
+            if switched
+            else SERVER_ALREADY_TEXT.format(label=server_label(existing))
+        )
+    else:
+        _invalidate_client_cache(context, url)
+        await _switch_server(context, row, int(created["id"]))
+        text = SERVER_ADDED_TEXT.format(label=server_label(created))
+    logger.info(
+        "Server %s selected for telegram_id %s (credentials: %s)",
+        _server_host(url),
+        telegram_id,
+        "present" if (username or password) else "none",
+    )
+    await message.reply_text(text)
+
+
+async def _set_server_password(
+    update: Update, context, row, state: dict, value: Optional[str]
+) -> None:
+    message = update.effective_message
+    try:
+        await message.delete()
+    except Exception:
+        logger.debug("Could not delete the password message", exc_info=True)
+    state["password"] = value
+    await _finalize_server_add(update, context, row, state)
+
+
+async def _handle_server_input(
+    update: Update, context, row, text: str
+) -> None:
+    telegram_id = int(row["telegram_id"])
+    state = PENDING_SERVER_INPUT.get(telegram_id)
+    if state is None:
+        return
+    message = update.effective_message
+    literal = (text or "").strip()
+    lowered = literal.lower()
+    if lowered in SERVER_CANCEL_WORDS:
+        PENDING_SERVER_INPUT.pop(telegram_id, None)
+        await message.reply_text(SERVER_CANCELLED_TEXT)
+        return
+    step = state.get("step")
+    if step == "url":
+        parsed = parse_server_url_with_credentials(literal)
+        if parsed is None:
+            await message.reply_text(SERVER_INVALID_URL_TEXT)
+            return
+        url, embedded_username, embedded_password = parsed
+        state["base_url"] = url
+        if embedded_username or embedded_password is not None:
+            state["username"] = embedded_username
+            state["password"] = embedded_password
+        state["step"] = "username"
+        await message.reply_text(SERVER_USERNAME_PROMPT_TEXT)
+        return
+    if step == "username":
+        if lowered in SERVER_SKIP_WORDS:
+            state["username"] = None
+            state["step"] = "token"
+            await message.reply_text(SERVER_TOKEN_PROMPT_TEXT)
+            return
+        state["username"] = literal
+        state["step"] = "password"
+        await message.reply_text(SERVER_PASSWORD_PROMPT_TEXT)
+        return
+    if step == "password":
+        await _set_server_password(
+            update,
+            context,
+            row,
+            state,
+            "" if lowered in SERVER_SKIP_WORDS else literal,
+        )
+        return
+    if step == "token":
+        await _set_server_password(
+            update,
+            context,
+            row,
+            state,
+            None if lowered in SERVER_SKIP_WORDS else literal,
+        )
+        return
+    PENDING_SERVER_INPUT.pop(telegram_id, None)
+
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    row = await _require_authenticated(update)
+    if row is None:
+        return
+    telegram_id = int(row["telegram_id"])
+    state = PENDING_SERVER_INPUT.get(telegram_id)
+    message = update.effective_message
+    if state is None:
+        await message.reply_text(SERVER_NOTHING_TO_SKIP_TEXT)
+        return
+    step = state.get("step")
+    if step == "username":
+        state["username"] = None
+        state["step"] = "token"
+        await message.reply_text(SERVER_TOKEN_PROMPT_TEXT)
+        return
+    if step == "password":
+        await _set_server_password(update, context, row, state, "")
+        return
+    if step == "token":
+        await _set_server_password(update, context, row, state, None)
+        return
+    await message.reply_text(SERVER_NOTHING_TO_SKIP_TEXT)
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    row = await _require_authenticated(update)
+    if row is None:
+        return
+    telegram_id = int(row["telegram_id"])
+    message = update.effective_message
+    if PENDING_SERVER_INPUT.pop(telegram_id, None) is not None:
+        await message.reply_text(SERVER_CANCELLED_TEXT)
+    else:
+        await message.reply_text(SERVER_NOTHING_TO_CANCEL_TEXT)
+
+
+async def _use_server(update: Update, context, row, server_id: int) -> None:
+    message = update.effective_message
+    server = database.get_server(server_id)
+    if server is None:
+        await message.reply_text(SERVER_NOT_FOUND_TEXT)
+        return
+    switched = await _switch_server(context, row, server_id)
+    text = (
+        SERVER_SWITCHED_TEXT.format(label=server_label(server))
+        if switched
+        else SERVER_ALREADY_TEXT.format(label=server_label(server))
+    )
+    await message.reply_text(text)
+
+
+async def _remove_server(update: Update, context, row, server_id: int) -> None:
+    message = update.effective_message
+    server = database.get_server(server_id)
+    if server is None:
+        await message.reply_text(SERVER_NOT_FOUND_TEXT)
+        return
+    if not database.delete_server(server_id):
+        await message.reply_text(SERVER_LAST_TEXT)
+        return
+    _invalidate_client_cache(context, str(_row_get(server, "base_url", "") or ""))
+    request_event_refresh(context)
+    await message.reply_text(SERVER_REMOVED_TEXT.format(label=server_label(server)))
+
+
+async def server_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    row = await _require_authenticated(update)
+    if row is None:
+        return
+    message = update.effective_message
+    args = context.args or []
+    if not args:
+        await _show_servers(update, context, row)
+        return
+    action = args[0].lower()
+    if action == "list":
+        await _show_servers(update, context, row)
+        return
+    if action == "add":
+        if len(args) < 2:
+            await message.reply_text(SERVER_USAGE_TEXT)
+            return
+        parsed = parse_server_url_with_credentials(args[1])
+        if parsed is None:
+            await message.reply_text(SERVER_INVALID_URL_TEXT)
+            return
+        url, embedded_username, embedded_password = parsed
+        label = " ".join(args[2:]).strip() or None
+        PENDING_SERVER_INPUT[int(row["telegram_id"])] = {
+            "step": "username",
+            "base_url": url,
+            "label": label,
+            "username": embedded_username,
+            "password": embedded_password,
+        }
+        await message.reply_text(SERVER_USERNAME_PROMPT_TEXT)
+        return
+    if action == "use":
+        if len(args) < 2 or not args[1].isdigit():
+            await message.reply_text(SERVER_USAGE_TEXT)
+            return
+        await _use_server(update, context, row, int(args[1]))
+        return
+    if action == "remove":
+        if not admin_only(update):
+            await message.reply_text(SERVER_ADMIN_ONLY_TEXT)
+            return
+        if len(args) < 2 or not args[1].isdigit():
+            await message.reply_text(SERVER_USAGE_TEXT)
+            return
+        await _remove_server(update, context, row, int(args[1]))
+        return
+    await message.reply_text(SERVER_USAGE_TEXT)
+
+
+async def _edit_server_message(query, text: str, keyboard) -> None:
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard)
+    except Exception:
+        logger.warning("Could not update server message", exc_info=True)
+
+
+async def server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    caller = getattr(query, "from_user", None)
+    row = (
+        database.get_user_by_telegram_id(int(caller.id))
+        if caller is not None
+        else None
+    )
+    if row is None or not bool(row["is_authenticated"]):
+        await query.answer("Not authorized.", show_alert=True)
+        return
+    data = query.data or ""
+    is_admin = admin_only(update)
+    if data == SERVER_ADD_CALLBACK:
+        PENDING_SERVER_INPUT[int(row["telegram_id"])] = {
+            "step": "url",
+            "base_url": None,
+            "label": None,
+            "username": None,
+            "password": None,
+        }
+        await query.answer()
+        try:
+            await query.edit_message_text(SERVER_ADD_PROMPT_TEXT, reply_markup=None)
+        except Exception:
+            logger.warning("Could not prompt for the server URL", exc_info=True)
+        return
+    if data.startswith(SERVER_USE_PREFIX):
+        value = data[len(SERVER_USE_PREFIX) :]
+        if not value.isdigit():
+            await query.answer()
+            return
+        server = database.get_server(int(value))
+        if server is None:
+            await query.answer(SERVER_NOT_FOUND_TEXT, show_alert=True)
+            return
+        switched = await _switch_server(context, row, int(server["id"]))
+        await query.answer()
+        text, keyboard = _servers_message(
+            row,
+            prefix=(
+                SERVER_SWITCHED_TEXT.format(label=server_label(server))
+                if switched
+                else SERVER_ALREADY_TEXT.format(label=server_label(server))
+            ),
+        )
+        await _edit_server_message(query, text, keyboard)
+        return
+    if data.startswith(SERVER_REMOVE_PREFIX):
+        if not is_admin:
+            await query.answer(SERVER_ADMIN_ONLY_TEXT, show_alert=True)
+            return
+        value = data[len(SERVER_REMOVE_PREFIX) :]
+        if not value.isdigit():
+            await query.answer()
+            return
+        server = database.get_server(int(value))
+        if server is None:
+            await query.answer(SERVER_NOT_FOUND_TEXT, show_alert=True)
+            return
+        if not database.delete_server(int(server["id"])):
+            await query.answer(SERVER_LAST_TEXT, show_alert=True)
+            return
+        _invalidate_client_cache(
+            context, str(_row_get(server, "base_url", "") or "")
+        )
+        request_event_refresh(context)
+        await query.answer()
+        text, keyboard = _servers_message(
+            row, prefix=SERVER_REMOVED_TEXT.format(label=server_label(server))
+        )
+        await _edit_server_message(query, text, keyboard)
+        return
+    await query.answer()
 
 
 async def handle_event(event: dict, *, bot, client) -> None:
@@ -2202,6 +3150,9 @@ async def handle_event(event: dict, *, bot, client) -> None:
         if not request.id or not request.session_id:
             logger.warning("Ignoring malformed permission.asked event: %s", event)
             return
+        PERMISSION_SERVERS[request.id] = _normalize_base_url(
+            getattr(client, "base_url", "")
+        )
         row = database.get_user_by_session_id(request.session_id)
         if row is None:
             logger.info("Permission request for unknown session %s", request.session_id)
@@ -2233,7 +3184,13 @@ async def handle_event(event: dict, *, bot, client) -> None:
         session = database.get_opencode_session(int(row["id"]))
         if session is not None:
             directory = session["directory"]
-        await present_question(bot, row, properties, directory=directory)
+        await present_question(
+            bot,
+            row,
+            properties,
+            directory=directory,
+            base_url=_normalize_base_url(getattr(client, "base_url", "")),
+        )
         return
     if event_type in {"question.replied", "question.rejected"}:
         properties = event.get("properties") or {}

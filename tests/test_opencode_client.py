@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -331,7 +332,7 @@ async def test_reply_question_sends_directory_override(tmp_path):
     await oc.reply_question("que_1", [["Purple"]], directory="D:/x")
 
     assert captured["path"] == "/question/que_1/reply"
-    assert captured["directory"] == str(Path("D:/x"))
+    assert captured["directory"] == "D:/x"
     assert captured["body"] == {"answers": [["Purple"]]}
 
 
@@ -348,7 +349,7 @@ async def test_reject_question_sends_directory_override(tmp_path):
     await oc.reject_question("que_1", directory="D:/x")
 
     assert captured["path"] == "/question/que_1/reject"
-    assert captured["directory"] == str(Path("D:/x"))
+    assert captured["directory"] == "D:/x"
 
 
 @pytest.mark.asyncio
@@ -472,7 +473,7 @@ async def test_stream_events_passes_directory_override(tmp_path):
     events = [event async for event in oc.stream_events(directory="D:/jcp")]
 
     assert events == [{"id": "e1"}]
-    assert captured["directory"] == str(Path("D:/jcp"))
+    assert captured["directory"] == "D:/jcp"
 
 
 @pytest.mark.asyncio
@@ -648,7 +649,7 @@ async def test_list_sessions_sends_directory_and_limit(tmp_path):
     assert captured == {
         "method": "GET",
         "path": "/session",
-        "directory": str(Path("/tmp/work")),
+        "directory": "/tmp/work",
         "limit": "7",
     }
 
@@ -1174,7 +1175,7 @@ async def test_send_prompt_includes_model_when_provided(tmp_path):
         "parts": [{"type": "text", "text": "hi"}],
         "model": {"providerID": "opencode-go", "modelID": "deepseek-v4.1-flash"},
     }
-    assert captured["directory"] == str(Path("/tmp/work"))
+    assert captured["directory"] == "/tmp/work"
 
 
 @pytest.mark.asyncio
@@ -1197,7 +1198,7 @@ async def test_create_session_includes_model_when_provided(tmp_path):
         "title": "hello",
         "model": {"id": "gpt-5", "providerID": "opencode"},
     }
-    assert captured["directory"] == str(Path("/tmp/work"))
+    assert captured["directory"] == "/tmp/work"
 
 
 @pytest.mark.asyncio
@@ -1276,3 +1277,285 @@ def test_constructor_reads_config_defaults(monkeypatch, tmp_path):
     assert oc.directory == tmp_path
     assert oc.timeout == 12.5
     assert config.OPENCODE_AGENT == "plan"
+
+
+def _capture_auth_client(monkeypatch, handler) -> dict:
+    """Let an internally-created AsyncClient use a MockTransport.
+
+    The real ``httpx.AsyncClient`` is wrapped so the arguments the client passes
+    (``auth``/``headers``) are captured while a MockTransport services requests.
+    """
+    real = httpx.AsyncClient
+    captured: dict = {}
+
+    def factory(*args, **kwargs):
+        captured["auth"] = kwargs.get("auth")
+        captured["headers"] = kwargs.get("headers")
+        forward = {}
+        if kwargs.get("auth") is not None:
+            forward["auth"] = kwargs["auth"]
+        if kwargs.get("headers") is not None:
+            forward["headers"] = kwargs["headers"]
+        return real(transport=httpx.MockTransport(handler), **forward)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return captured
+
+
+def _basic_header(username: str, password: str) -> str:
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+@pytest.mark.asyncio
+async def test_basic_auth_header_sent_when_username_set(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(base_url=BASE_URL, username="alice", password="s3cret")
+
+    assert await oc.health() is True
+    assert seen["authorization"] == _basic_header("alice", "s3cret")
+
+
+@pytest.mark.asyncio
+async def test_bearer_auth_header_sent_when_only_secret_set(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(base_url=BASE_URL, token="tok-123")
+
+    assert await oc.health() is True
+    assert seen["authorization"] == "Bearer tok-123"
+
+
+@pytest.mark.asyncio
+async def test_no_authorization_header_without_credentials(monkeypatch):
+    seen: dict = {"authorization": "unset"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(base_url=BASE_URL)
+
+    assert await oc.health() is True
+    assert seen["authorization"] is None
+
+
+@pytest.mark.asyncio
+async def test_password_wins_over_token_alias(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(
+        base_url=BASE_URL, username="alice", password="pw", token="tok"
+    )
+
+    assert await oc.health() is True
+    assert seen["authorization"] == _basic_header("alice", "pw")
+
+
+@pytest.mark.asyncio
+async def test_stream_events_carries_auth(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"id": "e1"}\n\n',
+        )
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(base_url=BASE_URL, username="alice", password="s3cret")
+
+    events = [event async for event in oc.stream_events()]
+
+    assert events == [{"id": "e1"}]
+    assert seen["authorization"] == _basic_header("alice", "s3cret")
+
+
+@pytest.mark.asyncio
+async def test_error_message_does_not_include_credentials(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    _capture_auth_client(monkeypatch, handler)
+    oc = OpenCodeClient(base_url=BASE_URL, username="alice", password="s3cret")
+
+    with pytest.raises(OpenCodeError) as excinfo:
+        await oc.create_session()
+
+    assert "s3cret" not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_get_path_returns_body(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/path"
+        assert request.url.params.get("directory") == str(tmp_path)
+        return httpx.Response(
+            200, json={"home": "/Users/nix", "directory": "/Users/nix/work"}
+        )
+
+    oc = _make(handler, tmp_path)
+    assert await oc.get_path() == {
+        "home": "/Users/nix",
+        "directory": "/Users/nix/work",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_path_raises_on_error_status(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="UnknownError")
+
+    oc = _make(handler, tmp_path)
+    with pytest.raises(OpenCodeError):
+        await oc.get_path()
+
+
+@pytest.mark.asyncio
+async def test_list_directory_sends_path_and_directory(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/file"
+        assert request.url.params.get("path") == "/Users/nix"
+        assert request.url.params.get("directory") == "/Users/nix"
+        return httpx.Response(
+            200,
+            json=[
+                {"name": "src", "absolute": "/Users/nix/src", "type": "directory"},
+                {"name": "a.txt", "absolute": "/Users/nix/a.txt", "type": "file"},
+            ],
+        )
+
+    oc = _make(handler, tmp_path)
+    result = await oc.list_directory("/Users/nix")
+    assert result[0]["type"] == "directory"
+    assert result[1]["name"] == "a.txt"
+
+
+@pytest.mark.asyncio
+async def test_list_directory_directory_defaults_to_path(tmp_path):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["directory"] = request.url.params.get("directory")
+        return httpx.Response(200, json=[])
+
+    oc = _make(handler, tmp_path)
+    await oc.list_directory("/srv/app")
+    assert seen["directory"] == "/srv/app"
+
+
+@pytest.mark.asyncio
+async def test_list_directory_raises_on_error_status(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="UnknownError")
+
+    oc = _make(handler, tmp_path)
+    with pytest.raises(OpenCodeError):
+        await oc.list_directory("/does/not/exist")
+
+
+@pytest.mark.asyncio
+async def test_default_directory_prefers_directory(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"home": "/Users/nix", "directory": "/work"})
+
+    oc = _make(handler, tmp_path)
+    assert await oc.default_directory() == "/work"
+
+
+@pytest.mark.asyncio
+async def test_default_directory_falls_back_to_home(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"home": "/Users/nix"})
+
+    oc = _make(handler, tmp_path)
+    assert await oc.default_directory() == "/Users/nix"
+
+
+@pytest.mark.asyncio
+async def test_default_directory_falls_back_to_root_on_error(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="UnknownError")
+
+    oc = _make(handler, tmp_path)
+    assert await oc.default_directory() == "/"
+
+
+@pytest.mark.asyncio
+async def test_default_directory_falls_back_to_root_on_empty_body(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    oc = _make(handler, tmp_path)
+    assert await oc.default_directory() == "/"
+
+
+def test_params_preserves_server_posix_path_exactly():
+    oc = OpenCodeClient(base_url="http://remote.test:4096")
+    assert oc._params("/Users/nix") == {"directory": "/Users/nix"}
+    assert oc._params("/Users/nix/my project") == {
+        "directory": "/Users/nix/my project"
+    }
+
+
+def test_params_preserves_server_windows_path_exactly():
+    oc = OpenCodeClient(base_url="http://remote.test:4096")
+    assert oc._params(r"D:\Projects\jcp") == {"directory": r"D:\Projects\jcp"}
+
+
+def test_custom_server_has_no_default_directory():
+    oc = OpenCodeClient(base_url="http://remote.test:4096")
+    assert oc.directory is None
+    assert oc._params() == {}
+
+
+def test_default_server_uses_config_directory():
+    oc = OpenCodeClient()
+    assert oc._params() == {"directory": str(config.OPENCODE_DIRECTORY)}
+
+
+@pytest.mark.asyncio
+async def test_custom_server_create_session_omits_unset_directory():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(200, json={"id": "ses_1"})
+
+    oc = OpenCodeClient(base_url="http://remote.test:4096", client=_client(handler))
+    await oc.create_session(title="t")
+    assert captured["directory"] is None
+
+
+@pytest.mark.asyncio
+async def test_custom_server_create_session_sends_exact_directory():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["directory"] = request.url.params.get("directory")
+        return httpx.Response(200, json={"id": "ses_1"})
+
+    oc = OpenCodeClient(base_url="http://remote.test:4096", client=_client(handler))
+    await oc.create_session(title="t", directory="/Users/nix")
+    assert captured["directory"] == "/Users/nix"

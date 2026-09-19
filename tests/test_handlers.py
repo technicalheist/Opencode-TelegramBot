@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
-import sys
+import logging
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
+from telegram.ext import ApplicationHandlerStop
 
+import config
 from telegram_bot import handlers
 
 
@@ -31,6 +33,7 @@ class FakeMessage:
         self.reply_voice = AsyncMock(side_effect=self._voice)
         self.reply_document = AsyncMock(side_effect=self._document)
         self.reply_photo = AsyncMock(side_effect=self._photo)
+        self.delete = AsyncMock()
 
     async def _reply(self, text, **kwargs):
         self.sent.append(text)
@@ -73,6 +76,7 @@ class FakeApplication:
 class FakeClient:
     def __init__(self, reply="hello from opencode"):
         self.directory = "D:/repo"
+        self.base_url = handlers.config.OPENCODE_BASE_URL
         self.create_session = AsyncMock(return_value={"id": "ses_new"})
         self.send_prompt = AsyncMock(return_value=reply)
         self.abort = AsyncMock()
@@ -91,6 +95,11 @@ class FakeClient:
         self.list_questions = AsyncMock(return_value=[])
         self.reply_question = AsyncMock()
         self.reject_question = AsyncMock()
+        self.get_path = AsyncMock(return_value={})
+        self.default_directory = AsyncMock(
+            return_value=str(handlers.config.OPENCODE_DIRECTORY)
+        )
+        self.list_directory = AsyncMock(return_value=[])
 
 
 class FakeDB:
@@ -99,15 +108,37 @@ class FakeDB:
         self.voice = voice
         self.sessions: dict[int, dict] = {}
         self.workdirs: dict[int, str] = {}
+        self.user_workdirs: dict[tuple[int, int], str] = {}
         self.models: dict[int, tuple[str, str]] = {}
+        self.user_models: dict[tuple[int, int], tuple[str, str]] = {}
         self.media: dict[int, dict] = {}
         self.session_rows: list[dict] = []
+        self.approval_requested_at = row.get("approval_requested_at")
+        self.servers: dict[int, dict] = {}
+        self.next_server_id = 1
+        self.user_servers: dict[int, int] = {}
 
     def upsert_user(self, *args, **kwargs):
         return self.row
 
     def get_user_by_telegram_id(self, telegram_id):
         return self.row
+
+    def set_approval_requested(self, telegram_id, value):
+        self.approval_requested_at = "2026-01-01T00:00:00+00:00" if value else None
+        self.row["approval_requested_at"] = self.approval_requested_at
+
+    def has_pending_approval(self, telegram_id):
+        return bool(self.approval_requested_at) and not bool(
+            self.row["is_authenticated"]
+        )
+
+    def set_authenticated(self, telegram_id, value):
+        self.row["is_authenticated"] = 1 if value else 0
+        return True
+
+    def is_authenticated(self, telegram_id):
+        return bool(self.row["is_authenticated"])
 
     def get_voice_mode(self, telegram_id):
         return self.voice
@@ -116,29 +147,117 @@ class FakeDB:
         self.voice = enabled
         return True
 
-    def get_workdir(self, telegram_id):
-        return self.workdirs.get(telegram_id)
+    def get_workdir(self, telegram_id, server_id=None):
+        if server_id is None:
+            return self.workdirs.get(int(telegram_id))
+        key = (int(telegram_id), int(server_id))
+        if key in self.user_workdirs:
+            return self.user_workdirs[key]
+        if self.default_server_id() == int(server_id):
+            return self.workdirs.get(int(telegram_id))
+        return None
 
-    def set_workdir(self, telegram_id, directory):
-        self.workdirs[telegram_id] = directory
+    def set_workdir(self, telegram_id, directory, server_id=None):
+        if server_id is None:
+            self.workdirs[int(telegram_id)] = directory
+            return
+        self.user_workdirs[(int(telegram_id), int(server_id))] = directory
+        if self.default_server_id() == int(server_id):
+            self.workdirs[int(telegram_id)] = directory
 
-    def get_model(self, telegram_id):
-        return self.models.get(telegram_id)
+    def default_server_id(self):
+        ids = sorted(self.servers)
+        return ids[0] if ids else None
 
-    def set_model(self, telegram_id, provider_id, model_id):
-        self.models[telegram_id] = (provider_id, model_id)
+    def get_model(self, telegram_id, server_id=None):
+        if server_id is None:
+            return self.models.get(int(telegram_id))
+        key = (int(telegram_id), int(server_id))
+        if key in self.user_models:
+            return self.user_models[key]
+        if self.default_server_id() == int(server_id):
+            return self.models.get(int(telegram_id))
+        return None
+
+    def set_model(self, telegram_id, provider_id, model_id, server_id=None):
+        if server_id is None:
+            self.models[int(telegram_id)] = (provider_id, model_id)
+            return
+        self.user_models[(int(telegram_id), int(server_id))] = (
+            provider_id,
+            model_id,
+        )
+        if self.default_server_id() == int(server_id):
+            self.models[int(telegram_id)] = (provider_id, model_id)
 
     def get_opencode_session(self, user_id):
         return self.sessions.get(user_id)
 
-    def set_opencode_session(self, user_id, session_id, directory):
+    def set_opencode_session(self, user_id, session_id, directory, server_id=None):
         self.sessions[user_id] = {
             "session_id": session_id,
             "directory": directory,
+            "server_id": server_id,
         }
 
     def delete_opencode_session(self, user_id):
         return self.sessions.pop(user_id, None) is not None
+
+    def ensure_default_server(self, base_url, label="Local"):
+        return self.add_server(label, base_url)
+
+    def add_server(
+        self, label, base_url, created_by=None, username=None, password=None
+    ):
+        base = (base_url or "").rstrip("/")
+        if any(row["base_url"] == base for row in self.servers.values()):
+            return None
+        server_id = self.next_server_id
+        self.next_server_id += 1
+        row = {
+            "id": server_id,
+            "label": label,
+            "base_url": base,
+            "created_by": created_by,
+            "username": username,
+            "password": password,
+        }
+        self.servers[server_id] = row
+        return row
+
+    def list_servers(self):
+        return [self.servers[key] for key in sorted(self.servers)]
+
+    def get_server(self, server_id):
+        return self.servers.get(int(server_id))
+
+    def get_server_by_url(self, base_url):
+        base = (base_url or "").rstrip("/")
+        for row in self.servers.values():
+            if row["base_url"] == base:
+                return row
+        return None
+
+    def delete_server(self, server_id):
+        server_id = int(server_id)
+        if len(self.servers) <= 1 or server_id not in self.servers:
+            return False
+        self.servers.pop(server_id)
+        for telegram_id, active in list(self.user_servers.items()):
+            if active == server_id:
+                self.user_servers.pop(telegram_id)
+        return True
+
+    def get_user_server(self, telegram_id):
+        server_id = self.user_servers.get(int(telegram_id))
+        if server_id is not None and server_id in self.servers:
+            return self.servers[server_id]
+        servers = self.list_servers()
+        return servers[0] if servers else None
+
+    def set_user_server(self, telegram_id, server_id):
+        self.user_servers[int(telegram_id)] = int(server_id)
+        return True
 
     def get_user_by_session_id(self, session_id):
         for session in self.sessions.values():
@@ -173,7 +292,30 @@ def _row(*, telegram_id=111, authenticated=1):
         "is_authenticated": authenticated,
         "role": "user",
         "voice_mode": 0,
+        "approval_requested_at": None,
     }
+
+
+class FakeBot:
+    def __init__(self, error=None):
+        self.messages: list[dict] = []
+        self.error = error
+
+    async def send_message(self, chat_id=None, text=None, reply_markup=None, **kwargs):
+        if self.error is not None:
+            raise self.error
+        self.messages.append(
+            {"chat_id": chat_id, "text": text, "reply_markup": reply_markup}
+        )
+        return SimpleNamespace(message_id=len(self.messages))
+
+
+def _context_with_bot(client, bot):
+    return SimpleNamespace(
+        bot_data={"opencode": client},
+        bot=bot,
+        application=FakeApplication(),
+    )
 
 
 def _update(text=None, voice=None, telegram_id=111):
@@ -209,6 +351,8 @@ def _clear_locks():
     handlers.ACTIVE_TASKS.clear()
     handlers.SENT_MEDIA.clear()
     handlers.PENDING_QUESTIONS.clear()
+    handlers.PENDING_SERVER_INPUT.clear()
+    handlers.PERMISSION_SERVERS.clear()
     yield
     handlers.USER_LOCKS.clear()
     handlers.MODEL_CHOICES.clear()
@@ -217,6 +361,8 @@ def _clear_locks():
     handlers.ACTIVE_TASKS.clear()
     handlers.SENT_MEDIA.clear()
     handlers.PENDING_QUESTIONS.clear()
+    handlers.PENDING_SERVER_INPUT.clear()
+    handlers.PERMISSION_SERVERS.clear()
 
 
 def test_split_message_at_exact_limit():
@@ -492,11 +638,89 @@ async def test_ensure_session_creates_and_persists(monkeypatch):
 @pytest.mark.asyncio
 async def test_ensure_session_reuses_existing(monkeypatch):
     db = FakeDB(_row())
-    db.sessions[1] = {"session_id": "ses_existing", "directory": "D:/repo"}
+    directory = str(handlers.config.OPENCODE_DIRECTORY)
+    db.sessions[1] = {"session_id": "ses_existing", "directory": directory}
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
 
     session_id = await handlers.ensure_session(db.row, client)
+
+    assert session_id == "ses_existing"
+    client.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_recreates_when_directory_differs(monkeypatch):
+    db = FakeDB(_row())
+    db.sessions[1] = {"session_id": "ses_old", "directory": "/stale/path"}
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+
+    session_id = await handlers.ensure_session(db.row, client)
+
+    assert session_id == "ses_new"
+    client.create_session.assert_awaited_once()
+    assert db.sessions[1]["directory"] == str(handlers.config.OPENCODE_DIRECTORY)
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_heals_invalid_stored_workdir(monkeypatch):
+    db = FakeDB(_row())
+    db.workdirs[111] = "/does/not/exist"
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/Users/nix")
+
+    async def list_directory(path):
+        if path != "/Users/nix":
+            from opencode_client import OpenCodeError
+
+            raise OpenCodeError("UnknownError")
+        return []
+
+    client.list_directory = AsyncMock(side_effect=list_directory)
+
+    session_id = await handlers.ensure_session(db.row, client, directory="/does/not/exist")
+
+    assert session_id == "ses_new"
+    assert db.workdirs[111] == "/Users/nix"
+    assert db.sessions[1]["directory"] == "/Users/nix"
+    create_kwargs = client.create_session.await_args.kwargs
+    assert create_kwargs["directory"] == "/Users/nix"
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_replaces_legacy_server_session(monkeypatch):
+    db = FakeDB(_row())
+    directory = str(handlers.config.OPENCODE_DIRECTORY)
+    db.sessions[1] = {
+        "session_id": "ses_legacy",
+        "directory": directory,
+        "server_id": None,
+    }
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+
+    session_id = await handlers.ensure_session(db.row, client, server_id=2)
+
+    assert session_id == "ses_new"
+    client.create_session.assert_awaited_once()
+    assert db.sessions[1]["server_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_reuses_matching_server_session(monkeypatch):
+    db = FakeDB(_row())
+    directory = str(handlers.config.OPENCODE_DIRECTORY)
+    db.sessions[1] = {
+        "session_id": "ses_existing",
+        "directory": directory,
+        "server_id": 2,
+    }
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+
+    session_id = await handlers.ensure_session(db.row, client, server_id=2)
 
     assert session_id == "ses_existing"
     client.create_session.assert_not_awaited()
@@ -526,6 +750,16 @@ def _command_context(client, args=None, application=None):
         args=args,
         application=application if application is not None else FakeApplication(),
     )
+
+
+def _patch_check_server(monkeypatch, healthy, calls=None):
+    async def check(base_url, username, password):
+        if calls is not None:
+            calls.append((base_url, username, password))
+        return healthy
+
+    monkeypatch.setattr(handlers, "_check_server", check)
+    return check
 
 
 def test_remember_models_and_keyboard_pagination_round_trip():
@@ -584,14 +818,287 @@ def test_parse_session_callback_round_trips():
     assert handlers.parse_session_callback("") is None
 
 
-def test_current_directory_uses_stored_workdir(monkeypatch):
+@pytest.mark.asyncio
+async def test_current_directory_uses_stored_workdir(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/srv/default")
 
-    assert handlers.current_directory(db.row) == str(handlers.config.OPENCODE_DIRECTORY)
+    assert await handlers.current_directory(db.row, client) == "/srv/default"
 
     db.workdirs[111] = "D:/projects/demo"
-    assert handlers.current_directory(db.row) == "D:/projects/demo"
+    assert await handlers.current_directory(db.row, client) == "D:/projects/demo"
+    client.default_directory.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_current_directory_does_not_fall_back_to_config_on_error(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(side_effect=RuntimeError("down"))
+
+    with pytest.raises(RuntimeError):
+        await handlers.current_directory(db.row, client)
+
+
+@pytest.mark.asyncio
+async def test_current_directory_uses_per_server_workdir(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/server/default")
+
+    assert await handlers.current_directory(
+        db.row, client, int(first["id"])
+    ) == "/server/default"
+
+    db.user_workdirs[(111, int(first["id"]))] = "/server/a"
+    assert await handlers.current_directory(
+        db.row, client, int(first["id"])
+    ) == "/server/a"
+    assert await handlers.current_directory(
+        db.row, client, int(second["id"])
+    ) == "/server/default"
+
+
+@pytest.mark.asyncio
+async def test_current_directory_switching_servers_uses_other_default(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.workdirs[111] = "/legacy-default"
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/server/b-default")
+
+    assert await handlers.current_directory(
+        db.row, client, int(first["id"])
+    ) == "/legacy-default"
+    assert await handlers.current_directory(
+        db.row, client, int(second["id"])
+    ) == "/server/b-default"
+
+
+@pytest.mark.asyncio
+async def test_browsable_workdir_heals_and_persists_per_server(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.user_workdirs[(111, int(first["id"]))] = "/stale"
+    db.user_workdirs[(111, int(second["id"]))] = "/keep"
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/server/a-default")
+
+    async def list_directory(path):
+        if path == "/stale":
+            raise OpenCodeError("UnknownError")
+        return []
+
+    client.list_directory = AsyncMock(side_effect=list_directory)
+
+    result = await handlers._browsable_workdir(db.row, client, int(first["id"]))
+
+    assert result == "/server/a-default"
+    assert db.get_workdir(111, int(first["id"])) == "/server/a-default"
+    assert db.get_workdir(111, int(second["id"])) == "/keep"
+
+
+@pytest.mark.asyncio
+async def test_workdir_command_no_args_heals_stale_workdir(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    first = db.add_server("A", handlers.config.OPENCODE_BASE_URL)
+    db.user_workdirs[(111, int(first["id"]))] = "/Users/nix"
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/srv/default")
+
+    async def list_directory(path):
+        if path == "/Users/nix":
+            raise OpenCodeError("UnknownError")
+        return []
+
+    client.list_directory = AsyncMock(side_effect=list_directory)
+
+    update = _update()
+    await handlers.workdir_command(update, _command_context(client, args=[]))
+
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/srv/default"
+    assert db.get_workdir(111, int(first["id"])) == "/srv/default"
+    assert (
+        handlers.WORKDIR_BROWSE_ERROR_TEXT.format(path="/Users/nix")
+        not in update.effective_message.sent
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_heals_into_correct_per_server_slot(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.user_workdirs[(111, int(first["id"]))] = "/bad"
+    db.user_workdirs[(111, int(second["id"]))] = "/keep"
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/srv/default")
+
+    async def list_directory(path):
+        if path == "/bad":
+            raise OpenCodeError("UnknownError")
+        return []
+
+    client.list_directory = AsyncMock(side_effect=list_directory)
+
+    session_id = await handlers.ensure_session(
+        db.row, client, directory="/bad", server_id=int(first["id"])
+    )
+
+    assert session_id == "ses_new"
+    assert db.sessions[1]["directory"] == "/srv/default"
+    assert db.get_workdir(111, int(first["id"])) == "/srv/default"
+    assert db.get_workdir(111, int(second["id"])) == "/keep"
+
+
+@pytest.mark.asyncio
+async def test_whoami_shows_active_server_workdir(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(second["id"]))
+    db.user_workdirs[(111, int(first["id"]))] = "/server/a"
+    db.user_workdirs[(111, int(second["id"]))] = "/server/b"
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.whoami(update, _context(FakeClient()))
+
+    assert "workdir: /server/b" in update.effective_message.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_whoami_shows_active_server_model(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(second["id"]))
+    db.set_model(111, "openrouter", "remote-only", int(first["id"]))
+    db.set_model(111, "opencode", "local-only", int(second["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.whoami(update, _context(FakeClient()))
+
+    assert "model: opencode/local-only" in update.effective_message.sent[-1]
+
+
+@pytest.mark.asyncio
+async def test_whoami_shows_default_model_for_unset_server(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(second["id"]))
+    db.set_model(111, "openrouter", "remote-only", int(first["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.whoami(update, _context(FakeClient()))
+
+    assert "model: default" in update.effective_message.sent[-1]
+
+
+def test_model_payload_uses_per_server_model(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_model(111, "openrouter", "remote-only", int(first["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+
+    assert handlers.model_payload(111, int(first["id"])) == {
+        "providerID": "openrouter",
+        "modelID": "remote-only",
+    }
+    assert handlers.model_payload(111, int(second["id"])) is None
+
+
+@pytest.mark.asyncio
+async def test_model_selection_is_per_server(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(first["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.remember_models(
+        111, [{"providerID": "openrouter", "modelID": "remote-only", "name": "R"}]
+    )
+    query = FakeQuery("mdl:m0")
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.model_callback(update, _context(FakeClient()))
+
+    assert db.get_model(111, int(first["id"])) == ("openrouter", "remote-only")
+    assert db.get_model(111, int(second["id"])) is None
+
+
+@pytest.mark.asyncio
+async def test_model_selection_resets_when_server_switches(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(first["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.remember_models(
+        111, [{"providerID": "openrouter", "modelID": "remote-only", "name": "R"}]
+    )
+    query = FakeQuery("mdl:m0")
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+    await handlers.model_callback(update, _context(FakeClient()))
+
+    db.set_user_server(111, int(second["id"]))
+
+    assert handlers.model_payload(111, int(second["id"])) is None
+
+
+@pytest.mark.asyncio
+async def test_models_command_selection_persists_per_server(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("A", "http://a:1")
+    second = db.add_server("B", "http://b:2")
+    db.set_user_server(111, int(second["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.list_models = AsyncMock(
+        return_value=[
+            {"providerID": "openrouter", "modelID": "remote-only", "name": "R"}
+        ]
+    )
+    monkeypatch.setattr(handlers, "_client", lambda context, server_row=None: client)
+
+    update = _update()
+    await handlers.models_command(update, _context(client))
+
+    query = FakeQuery("mdl:m0")
+    cb_update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+    await handlers.model_callback(cb_update, _context(FakeClient()))
+
+    assert db.get_model(111, int(second["id"])) == ("openrouter", "remote-only")
+    assert db.get_model(111, int(first["id"])) is None
+    assert db.get_model(111) is None
 
 
 @pytest.mark.asyncio
@@ -723,139 +1230,198 @@ async def test_session_callback_new_session_clears(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_workdir_rejects_non_directory(monkeypatch):
+async def test_workdir_command_browse_error_shows_error_text(monkeypatch):
+    from opencode_client import OpenCodeError
+
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    client.list_directory = AsyncMock(side_effect=OpenCodeError("UnknownError"))
 
     update = _update()
     await handlers.workdir_command(
-        update, _command_context(client, args=["Z:/does/not/exist/at/all"])
+        update, _command_context(client, args=["/does/not/exist"])
     )
 
     assert not db.workdirs
     client.create_session.assert_not_awaited()
-    assert any(
-        handlers.WORKDIR_INVALID_TEXT.format(path="Z:\\does\\not\\exist\\at\\all")
-        in text
-        or "not a directory" in text
-        for text in update.effective_message.sent
+    assert handlers.WORKDIR_BROWSE_ERROR_TEXT.format(path="/does/not/exist") in (
+        update.effective_message.sent
     )
 
 
+def test_parent_dir_posix():
+    assert handlers._parent_dir("/a/b") == "/a"
+    assert handlers._parent_dir("/a") == "/"
+    assert handlers._parent_dir("/") is None
+
+
+def test_parent_dir_windows():
+    assert handlers._parent_dir("C:\\a\\b") == "C:\\a"
+    assert handlers._parent_dir("C:\\") is None
+    assert handlers._parent_dir("C:/a/b") == "C:\\a"
+
+
+def test_parent_dir_unc():
+    assert handlers._parent_dir("\\\\srv\\share\\x") == "\\\\srv\\share"
+    assert handlers._parent_dir("\\\\srv\\share") is None
+
+
+def test_path_name_handles_both_separators():
+    assert handlers._path_name("/Users/nix/src") == "src"
+    assert handlers._path_name("C:\\Users\\nix\\src") == "src"
+    assert handlers._path_name("/Users/nix/src/") == "src"
+
+
 @pytest.mark.asyncio
-async def test_workdir_command_opens_browser_without_applying(monkeypatch, tmp_path):
-    (tmp_path / "child").mkdir()
-    (tmp_path / "note.txt").write_text("hi", encoding="utf-8")
+async def test_list_server_directory_filters_and_sorts(monkeypatch):
+    client = FakeClient()
+    client.list_directory = AsyncMock(
+        return_value=[
+            {"name": "Zeta", "absolute": "/root/Zeta", "type": "directory"},
+            {"name": "alpha", "absolute": "/root/alpha", "type": "directory"},
+            {"name": "b.txt", "absolute": "/root/b.txt", "type": "file"},
+            {"name": "a.txt", "absolute": "/root/a.txt", "type": "file"},
+            {"name": ".git", "absolute": "/root/.git", "type": "directory", "ignored": True},
+        ]
+    )
+
+    children, files, total = await handlers.list_server_directory(client, "/root")
+
+    assert children == ["/root/alpha", "/root/Zeta"]
+    assert files == ["a.txt", "b.txt"]
+    assert total == 2
+
+
+@pytest.mark.asyncio
+async def test_open_browser_renders_server_listing(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.list_directory = AsyncMock(
+        return_value=[
+            {"name": "src", "absolute": "/root/src", "type": "directory"},
+            {"name": "note.txt", "absolute": "/root/note.txt", "type": "file"},
+        ]
+    )
+
+    update = _update()
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
+
+    state = handlers.WORKDIR_BROWSE[111]
+    assert state["path"] == "/root"
+    assert state["children"] == ["/root/src"]
+    assert state["files"] == ["note.txt"]
+    assert state["total_files"] == 1
+    text = update.effective_message.sent[-1]
+    assert "📂 /root" in text
+    assert "note.txt" in text
+    markup = update.effective_message.reply_markups[-1]
+    labels = [button.text for row in markup.inline_keyboard for button in row]
+    assert "📁 src" in labels
+    assert "⬆️ Parent" in labels
+
+@pytest.mark.asyncio
+async def test_workdir_command_opens_browser_without_applying(monkeypatch):
     db = FakeDB(_row())
     db.models[111] = ("opencode-go", "deepseek")
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    client.list_directory = AsyncMock(
+        return_value=[{"name": "child", "absolute": "/root/child", "type": "directory"}]
+    )
 
     update = _update()
     await handlers.workdir_command(
-        update, _command_context(client, args=[str(tmp_path)])
+        update, _command_context(client, args=["/root"])
     )
 
     assert db.workdirs == {}
     client.create_session.assert_not_awaited()
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str(tmp_path.resolve())
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/root"
     markup = update.effective_message.reply_markups[-1]
     data = [
         button.callback_data for row in markup.inline_keyboard for button in row
     ]
     assert "wdir:use" in data
-    assert any(text.startswith(f"📂 {str(tmp_path.resolve())}") for text in update.effective_message.sent)
+    assert any(text.startswith("📂 /root") for text in update.effective_message.sent)
 
 
 @pytest.mark.asyncio
-async def test_workdir_command_normalizes_before_browsing(monkeypatch, tmp_path):
+async def test_workdir_command_passes_path_verbatim_to_server(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
 
-    raw = str(tmp_path) + os.sep
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[raw]))
+    await handlers.workdir_command(
+        update, _command_context(client, args=["/Users/nix/work"])
+    )
 
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str(tmp_path.resolve())
-
-    sub = tmp_path / "sub"
-    sub.mkdir()
-    monkeypatch.chdir(tmp_path)
-    update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=["sub"]))
-
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str(sub.resolve())
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/Users/nix/work"
+    client.list_directory.assert_awaited_once_with("/Users/nix/work")
 
 
 @pytest.mark.asyncio
-async def test_workdir_command_no_args_opens_browser_at_current(monkeypatch, tmp_path):
+async def test_workdir_command_no_args_opens_browser_at_current(monkeypatch):
     db = FakeDB(_row())
-    db.workdirs[111] = str(tmp_path)
+    db.workdirs[111] = "/Users/nix"
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
 
     update = _update()
     await handlers.workdir_command(update, _command_context(client, args=[]))
 
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str(tmp_path)
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/Users/nix"
     client.create_session.assert_not_awaited()
-    assert any(str(tmp_path) in text for text in update.effective_message.sent)
+    assert any("/Users/nix" in text for text in update.effective_message.sent)
 
 
 @pytest.mark.asyncio
-async def test_workdir_rejects_nonexistent_directory(monkeypatch, tmp_path):
+async def test_workdir_command_no_args_uses_server_default(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    client.default_directory = AsyncMock(return_value="/Users/nix")
 
-    missing = tmp_path / "missing"
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(missing)]))
+    await handlers.workdir_command(update, _command_context(client, args=[]))
 
-    assert not db.workdirs
-    client.create_session.assert_not_awaited()
-    assert any("not a directory" in text for text in update.effective_message.sent)
-
-
-def test_normalize_workdir_leading_slash_on_windows():
-    if sys.platform != "win32":
-        pytest.skip("Windows-only drive-relative path behavior")
-    normalized = handlers.normalize_workdir("/")
-    assert normalized is not None
-    assert normalized != "\\"
-    assert Path(normalized).is_absolute()
-    assert Path(normalized).drive
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/Users/nix"
+    client.default_directory.assert_awaited_once()
 
 
-def _make_tree(root, dirs=(), files=()):
-    for name in dirs:
-        (root / name).mkdir()
-    for name in files:
-        (root / name).write_text("x", encoding="utf-8")
-
-
-def _browser_data(markup, prefix):
+def _server_listing(*entries):
     return [
-        button.callback_data
-        for row in markup.inline_keyboard
-        for button in row
-        if button.callback_data.startswith(prefix)
+        {
+            "name": entry[0],
+            "absolute": entry[1],
+            "type": entry[2],
+        }
+        for entry in entries
     ]
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_navigates_into_child(monkeypatch, tmp_path):
-    _make_tree(tmp_path, dirs=["alpha", "beta"])
+async def test_workdir_callback_navigates_into_child(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
 
+    async def list_directory(path):
+        if path == "/root":
+            return _server_listing(
+                ("alpha", "/root/alpha", "directory"),
+                ("beta", "/root/beta", "directory"),
+            )
+        return []
+
+    client.list_directory = AsyncMock(side_effect=list_directory)
+
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(tmp_path)]))
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
     children = handlers.WORKDIR_BROWSE[111]["children"]
-    beta_index = children.index(str((tmp_path / "beta").resolve()))
+    beta_index = children.index("/root/beta")
 
     query = FakeQuery(f"wdir:o:{beta_index}", from_user=SimpleNamespace(id=111))
     cb_update = SimpleNamespace(
@@ -865,20 +1431,19 @@ async def test_workdir_callback_navigates_into_child(monkeypatch, tmp_path):
 
     query.edit_message_text.assert_awaited_once()
     assert query.answer.await_count == 1
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str((tmp_path / "beta").resolve())
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/root/beta"
     assert handlers.WORKDIR_BROWSE[111]["page"] == 0
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_up_goes_to_parent(monkeypatch, tmp_path):
-    _make_tree(tmp_path, dirs=["child"])
+async def test_workdir_callback_up_goes_to_parent(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
 
     handlers.WORKDIR_BROWSE[111] = {
         "owner": 111,
-        "path": str((tmp_path / "child").resolve()),
+        "path": "/root/child",
         "page": 0,
         "children": [],
     }
@@ -888,20 +1453,19 @@ async def test_workdir_callback_up_goes_to_parent(monkeypatch, tmp_path):
     )
     await handlers.workdir_callback(cb_update, _context(client))
 
-    assert handlers.WORKDIR_BROWSE[111]["path"] == str(tmp_path.resolve())
+    assert handlers.WORKDIR_BROWSE[111]["path"] == "/root"
     query.edit_message_text.assert_awaited_once()
     assert query.answer.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_up_at_root_alerts(monkeypatch, tmp_path):
+async def test_workdir_callback_up_at_root_alerts(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
-    root = str(Path(tmp_path).anchor)
     handlers.WORKDIR_BROWSE[111] = {
         "owner": 111,
-        "path": root,
+        "path": "/",
         "page": 0,
         "children": [],
     }
@@ -918,14 +1482,18 @@ async def test_workdir_callback_up_at_root_alerts(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_page_is_clamped(monkeypatch, tmp_path):
-    _make_tree(tmp_path, dirs=[f"d{index:02d}" for index in range(15)])
+async def test_workdir_callback_page_is_clamped(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    client.list_directory = AsyncMock(
+        return_value=_server_listing(
+            *[(f"d{index:02d}", f"/root/d{index:02d}", "directory") for index in range(15)]
+        )
+    )
 
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(tmp_path)]))
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
     assert handlers.WORKDIR_BROWSE[111]["page"] == 0
 
     query = FakeQuery("wdir:pg:99", from_user=SimpleNamespace(id=111))
@@ -939,74 +1507,102 @@ async def test_workdir_callback_page_is_clamped(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_refresh_rebuilds(monkeypatch, tmp_path):
-    _make_tree(tmp_path, dirs=["one"])
+async def test_workdir_callback_refresh_rebuilds(monkeypatch):
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    listing = {"entries": [("one", "/root/one", "directory")]}
+    client.list_directory = AsyncMock(
+        side_effect=lambda path: _server_listing(*listing["entries"])
+    )
 
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(tmp_path)]))
-    assert handlers.WORKDIR_BROWSE[111]["children"] == [str((tmp_path / "one").resolve())]
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
+    assert handlers.WORKDIR_BROWSE[111]["children"] == ["/root/one"]
 
-    (tmp_path / "two").mkdir()
+    listing["entries"].append(("two", "/root/two", "directory"))
     query = FakeQuery("wdir:refresh", from_user=SimpleNamespace(id=111))
     cb_update = SimpleNamespace(
         callback_query=query, effective_user=SimpleNamespace(id=111)
     )
     await handlers.workdir_callback(cb_update, _context(client))
 
-    assert handlers.WORKDIR_BROWSE[111]["children"] == [
-        str((tmp_path / "one").resolve()),
-        str((tmp_path / "two").resolve()),
-    ]
+    assert handlers.WORKDIR_BROWSE[111]["children"] == ["/root/one", "/root/two"]
     query.edit_message_text.assert_awaited_once()
     assert query.answer.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_use_persists_and_confirms(monkeypatch, tmp_path):
+async def test_workdir_callback_browse_error_shows_error_text(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.list_directory = AsyncMock(
+        return_value=_server_listing(("one", "/root/one", "directory"))
+    )
+
+    update = _update()
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
+
+    client.list_directory = AsyncMock(side_effect=OpenCodeError("UnknownError"))
+    query = FakeQuery("wdir:refresh", from_user=SimpleNamespace(id=111))
+    cb_update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+    await handlers.workdir_callback(cb_update, _context(client))
+
+    assert query.edit_message_text.await_args.args[0] == (
+        handlers.WORKDIR_BROWSE_ERROR_TEXT.format(path="/root")
+    )
+
+
+@pytest.mark.asyncio
+async def test_workdir_callback_use_persists_and_confirms(monkeypatch):
     db = FakeDB(_row())
     db.models[111] = ("opencode-go", "deepseek")
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
     client.create_session = AsyncMock(return_value={"id": "ses_browser"})
+    client.list_directory = AsyncMock(return_value=[])
 
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(tmp_path)]))
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
     query = FakeQuery("wdir:use", from_user=SimpleNamespace(id=111))
     cb_update = SimpleNamespace(
         callback_query=query, effective_user=SimpleNamespace(id=111)
     )
     await handlers.workdir_callback(cb_update, _context(client))
 
-    assert db.workdirs[111] == str(tmp_path.resolve())
+    assert db.workdirs[111] == "/root"
     assert db.sessions[1]["session_id"] == "ses_browser"
-    assert db.sessions[1]["directory"] == str(tmp_path.resolve())
+    assert db.sessions[1]["directory"] == "/root"
     create_kwargs = client.create_session.await_args.kwargs
-    assert create_kwargs["directory"] == str(tmp_path.resolve())
+    assert create_kwargs["directory"] == "/root"
     assert create_kwargs["model"] == {
         "providerID": "opencode-go",
         "modelID": "deepseek",
     }
     assert query.answer.await_count == 1
     assert query.edit_message_text.await_args.args[0] == handlers.WORKDIR_SET_TEXT.format(
-        path=str(tmp_path.resolve())
+        path="/root"
     )
     assert 111 not in handlers.WORKDIR_BROWSE
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_use_failure_does_not_persist_session(monkeypatch, tmp_path):
+async def test_workdir_callback_use_failure_does_not_persist_session(monkeypatch):
     from opencode_client import OpenCodeError
 
     db = FakeDB(_row())
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
+    client.list_directory = AsyncMock(return_value=[])
     client.create_session = AsyncMock(side_effect=OpenCodeError("boom"))
 
     update = _update()
-    await handlers.workdir_command(update, _command_context(client, args=[str(tmp_path)]))
+    await handlers.workdir_command(update, _command_context(client, args=["/root"]))
     query = FakeQuery("wdir:use", from_user=SimpleNamespace(id=111))
     cb_update = SimpleNamespace(
         callback_query=query, effective_user=SimpleNamespace(id=111)
@@ -1019,13 +1615,13 @@ async def test_workdir_callback_use_failure_does_not_persist_session(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_unauthenticated_is_refused(monkeypatch, tmp_path):
+async def test_workdir_callback_unauthenticated_is_refused(monkeypatch):
     db = FakeDB(_row(authenticated=0))
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
     handlers.WORKDIR_BROWSE[111] = {
         "owner": 111,
-        "path": str(tmp_path),
+        "path": "/root",
         "page": 0,
         "children": [],
     }
@@ -1044,13 +1640,13 @@ async def test_workdir_callback_unauthenticated_is_refused(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_workdir_callback_rejects_other_owner(monkeypatch, tmp_path):
+async def test_workdir_callback_rejects_other_owner(monkeypatch):
     db = FakeDB(_row(telegram_id=222))
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
     handlers.WORKDIR_BROWSE[222] = {
         "owner": 111,
-        "path": str(tmp_path),
+        "path": "/root",
         "page": 0,
         "children": [],
     }
@@ -1084,37 +1680,16 @@ async def test_workdir_callback_without_state_alerts(monkeypatch):
     assert query.answer.await_args.kwargs.get("show_alert") is True
 
 
-def test_list_child_dirs_only_dirs_sorted_case_insensitively(tmp_path):
-    _make_tree(
-        tmp_path,
-        dirs=["Zeta", "alpha", "Beta"],
-        files=["note.txt", "image.png"],
+def test_format_workdir_message_uses_server_files():
+    text = handlers.format_workdir_message(
+        "/root", ["/root/a", "/root/b"], ["x.txt", "y.txt"], 5, 0
     )
-
-    children = handlers.list_child_dirs(str(tmp_path))
-
-    assert [Path(child).name for child in children] == ["alpha", "Beta", "Zeta"]
-    assert all(Path(child).is_dir() for child in children)
-
-
-def test_list_child_dirs_raises_clean_oserror(tmp_path):
-    with pytest.raises(OSError):
-        handlers.list_child_dirs(str(tmp_path / "missing"))
-
-
-def test_preview_files_returns_files_and_total(tmp_path):
-    _make_tree(tmp_path, dirs=["sub"], files=["b.txt", "a.txt", "c.txt"])
-
-    names, total = handlers.preview_files(str(tmp_path), limit=2)
-
-    assert names == ["a.txt", "b.txt"]
-    assert total == 3
-
-
-def test_preview_files_oserror_safe(tmp_path):
-    names, total = handlers.preview_files(str(tmp_path / "missing"))
-    assert names == []
-    assert total == 0
+    assert "📂 /root" in text
+    assert "📁 Subdirectories: 2" in text
+    assert "📄 Files: 5" in text
+    assert "x.txt" in text and "y.txt" in text
+    assert "and 3 more" in text
+    assert "Page 1/1" in text
 
 
 def test_build_workdir_keyboard_contains_use_and_indexed_children():
@@ -3049,3 +3624,1258 @@ async def test_new_command_requests_event_refresh(monkeypatch):
     await handlers.new_command(update, context)
 
     assert event.is_set()
+
+
+def test_build_auth_keyboard_callback_data_within_limit():
+    keyboard = handlers.build_auth_keyboard(111)
+    data = _keyboard_data(keyboard)
+    assert data == ["auth:ok:111", "auth:no:111"]
+    assert all(
+        len(button.callback_data.encode("utf-8")) <= 64
+        for row in keyboard.inline_keyboard
+        for button in row
+    )
+
+
+def test_parse_auth_callback_round_trips():
+    assert handlers.parse_auth_callback("auth:ok:111") == (True, 111)
+    assert handlers.parse_auth_callback("auth:no:222") == (False, 222)
+    assert handlers.parse_auth_callback("auth:ok:") is None
+    assert handlers.parse_auth_callback("auth:maybe:1") is None
+    assert handlers.parse_auth_callback("") is None
+
+
+@pytest.mark.asyncio
+async def test_notify_admin_new_user_includes_profile_and_sets_flag(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+
+    await handlers.notify_admin_new_user(_context_with_bot(FakeClient(), bot), row)
+
+    assert len(bot.messages) == 1
+    sent = bot.messages[0]
+    assert sent["chat_id"] == config.ADMIN_USER_ID
+    assert "Alice A" in sent["text"]
+    assert "@alice" in sent["text"]
+    assert "111" in sent["text"]
+    assert "en" in sent["text"]
+    assert _keyboard_data(sent["reply_markup"]) == ["auth:ok:111", "auth:no:111"]
+    assert db.approval_requested_at is not None
+
+
+@pytest.mark.asyncio
+async def test_notify_admin_new_user_skips_authenticated(monkeypatch):
+    row = _row(authenticated=1)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+
+    await handlers.notify_admin_new_user(_context_with_bot(FakeClient(), bot), row)
+
+    assert bot.messages == []
+    assert db.approval_requested_at is None
+
+
+@pytest.mark.asyncio
+async def test_notify_admin_new_user_skips_already_requested(monkeypatch):
+    row = _row(authenticated=0)
+    row["approval_requested_at"] = "2026-01-01T00:00:00+00:00"
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+
+    await handlers.notify_admin_new_user(_context_with_bot(FakeClient(), bot), row)
+
+    assert bot.messages == []
+
+
+@pytest.mark.asyncio
+async def test_notify_admin_new_user_handles_forbidden(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot(error=Forbidden("bot was blocked by the user"))
+
+    await handlers.notify_admin_new_user(_context_with_bot(FakeClient(), bot), row)
+
+    assert db.approval_requested_at is None
+
+
+@pytest.mark.asyncio
+async def test_request_access_notifies_and_replies(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _update(text="/help")
+
+    await handlers.request_access(
+        update, _context_with_bot(FakeClient(), bot), row
+    )
+
+    assert handlers.ACCESS_PENDING_TEXT in update.effective_message.sent
+    assert len(bot.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_blocks_and_notifies_admin(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _update(text="/help")
+
+    with pytest.raises(ApplicationHandlerStop):
+        await handlers.guard_unauthenticated(
+            update, _context_with_bot(FakeClient(), bot)
+        )
+
+    assert handlers.ACCESS_PENDING_TEXT in update.effective_message.sent
+    assert len(bot.messages) == 1
+    assert _keyboard_data(bot.messages[0]["reply_markup"]) == [
+        "auth:ok:111",
+        "auth:no:111",
+    ]
+    assert db.approval_requested_at is not None
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_allows_start_and_id(monkeypatch):
+    for text in ("/start", "/start@MyBot", "/id", "/id 5"):
+        row = _row(authenticated=0)
+        db = FakeDB(row)
+        monkeypatch.setattr(handlers, "database", db)
+        bot = FakeBot()
+        update = _update(text=text)
+
+        await handlers.guard_unauthenticated(
+            update, _context_with_bot(FakeClient(), bot)
+        )
+
+        assert handlers.ACCESS_PENDING_TEXT not in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_does_not_renotify(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+
+    for _ in range(2):
+        update = _update(text="/help")
+        with pytest.raises(ApplicationHandlerStop):
+            await handlers.guard_unauthenticated(
+                update, _context_with_bot(FakeClient(), bot)
+            )
+
+    assert len(bot.messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_renotifies_after_rejection(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+
+    update = _update(text="/help")
+    with pytest.raises(ApplicationHandlerStop):
+        await handlers.guard_unauthenticated(
+            update, _context_with_bot(FakeClient(), bot)
+        )
+
+    db.set_approval_requested(111, False)
+    db.set_authenticated(111, False)
+
+    update = _update(text="/help")
+    with pytest.raises(ApplicationHandlerStop):
+        await handlers.guard_unauthenticated(
+            update, _context_with_bot(FakeClient(), bot)
+        )
+
+    assert len(bot.messages) == 2
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_allows_authenticated(monkeypatch):
+    row = _row(authenticated=1)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _update(text="/help")
+
+    await handlers.guard_unauthenticated(
+        update, _context_with_bot(FakeClient(), bot)
+    )
+
+    assert update.effective_message.sent == []
+    assert bot.messages == []
+
+
+@pytest.mark.asyncio
+async def test_guard_unauthenticated_allows_admin(monkeypatch):
+    row = _row(telegram_id=config.ADMIN_USER_ID, authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _update(text="/help", telegram_id=config.ADMIN_USER_ID)
+
+    await handlers.guard_unauthenticated(
+        update, _context_with_bot(FakeClient(), bot)
+    )
+
+    assert update.effective_message.sent == []
+    assert bot.messages == []
+
+
+def _server_state(step="url"):
+    return {
+        "step": step,
+        "base_url": "http://new:4096",
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_guard_clears_pending_server_input_for_command(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = _server_state()
+    update = _update(text="/help")
+
+    await handlers.guard_unauthenticated(
+        update, _context_with_bot(FakeClient(), FakeBot())
+    )
+
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+
+
+@pytest.mark.asyncio
+async def test_guard_keeps_pending_server_input_for_plain_text(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = _server_state()
+    update = _update(text="http://new:4096")
+
+    await handlers.guard_unauthenticated(
+        update, _context_with_bot(FakeClient(), FakeBot())
+    )
+
+    assert handlers.PENDING_SERVER_INPUT.get(111) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/skip", "/cancel"])
+async def test_guard_keeps_pending_server_input_for_skip_and_cancel(
+    monkeypatch, command
+):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = _server_state()
+    update = _update(text=command)
+
+    await handlers.guard_unauthenticated(
+        update, _context_with_bot(FakeClient(), FakeBot())
+    )
+
+    assert handlers.PENDING_SERVER_INPUT.get(111) is not None
+
+
+def _admin_update(data):
+    query = FakeQuery(data, from_user=SimpleNamespace(id=config.ADMIN_USER_ID))
+    return SimpleNamespace(
+        callback_query=query,
+        effective_user=SimpleNamespace(id=config.ADMIN_USER_ID),
+    )
+
+
+@pytest.mark.asyncio
+async def test_auth_callback_approve_persists_and_dms(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    db.set_approval_requested(111, True)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _admin_update("auth:ok:111")
+
+    await handlers.auth_callback(update, _context_with_bot(FakeClient(), bot))
+
+    assert row["is_authenticated"] == 1
+    assert db.approval_requested_at is None
+    update.callback_query.edit_message_text.assert_awaited_once()
+    assert "✅ Approved 111" in update.callback_query.edit_message_text.await_args.args[0]
+    assert len(bot.messages) == 1
+    assert bot.messages[0]["chat_id"] == 111
+    assert "approved" in bot.messages[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_auth_callback_reject_persists_and_dms(monkeypatch):
+    row = _row(authenticated=1)
+    db = FakeDB(row)
+    db.set_approval_requested(111, True)
+    row["is_authenticated"] = 0
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    update = _admin_update("auth:no:111")
+
+    await handlers.auth_callback(update, _context_with_bot(FakeClient(), bot))
+
+    assert row["is_authenticated"] == 0
+    assert db.approval_requested_at is None
+    assert "🚫 Rejected 111" in update.callback_query.edit_message_text.await_args.args[0]
+    assert bot.messages[0]["chat_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_auth_callback_non_admin_is_refused(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    bot = FakeBot()
+    query = FakeQuery("auth:ok:111", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.auth_callback(update, _context_with_bot(FakeClient(), bot))
+
+    assert row["is_authenticated"] == 0
+    query.edit_message_text.assert_not_awaited()
+    assert bot.messages == []
+    assert query.answer.await_count == 2
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_auth_callback_unknown_user_is_handled(monkeypatch):
+    row = _row(authenticated=0)
+    db = FakeDB(row)
+    monkeypatch.setattr(handlers, "database", db)
+    monkeypatch.setattr(db, "get_user_by_telegram_id", lambda telegram_id: None)
+    bot = FakeBot()
+    update = _admin_update("auth:ok:999")
+
+    await handlers.auth_callback(update, _context_with_bot(FakeClient(), bot))
+
+    assert bot.messages == []
+    update.callback_query.edit_message_text.assert_awaited_once()
+    assert "999" in update.callback_query.edit_message_text.await_args.args[0]
+
+
+def test_normalize_server_url_accepts_http_and_strips_slash():
+    assert (
+        handlers.normalize_server_url("http://localhost:4096")
+        == "http://localhost:4096"
+    )
+    assert (
+        handlers.normalize_server_url(" http://localhost:4096/ ")
+        == "http://localhost:4096"
+    )
+    assert (
+        handlers.normalize_server_url("https://example.com/oc/")
+        == "https://example.com/oc"
+    )
+
+
+def test_normalize_server_url_rejects_invalid():
+    assert handlers.normalize_server_url("") is None
+    assert handlers.normalize_server_url("   ") is None
+    assert handlers.normalize_server_url("localhost:4096") is None
+    assert handlers.normalize_server_url("ftp://example.com") is None
+    assert handlers.normalize_server_url("http://") is None
+    assert handlers.normalize_server_url("http://a b:4096") is None
+
+
+def test_build_servers_keyboard_marks_active_and_adds_button():
+    servers = [
+        {"id": 1, "label": "Local", "base_url": "http://localhost:4096"},
+        {
+            "id": 2,
+            "label": "Remote",
+            "base_url": "http://host.docker.internal:4096",
+        },
+    ]
+    keyboard = handlers.build_servers_keyboard(servers, 2)
+
+    data = _keyboard_data(keyboard)
+    assert "srv:use:1" in data
+    assert "srv:use:2" in data
+    assert "srv:add" in data
+    assert "srv:rm:1" not in data
+    labels = _keyboard_labels(keyboard)
+    assert labels[0] == "Local · localhost:4096"
+    assert labels[1].startswith("✅ ")
+    _assert_callback_data_within_limit(keyboard)
+
+
+def test_build_servers_keyboard_admin_shows_remove():
+    servers = [{"id": 1, "label": "Local", "base_url": "http://localhost:4096"}]
+    keyboard = handlers.build_servers_keyboard(servers, 1, is_admin=True)
+    assert "srv:rm:1" in _keyboard_data(keyboard)
+
+
+def test_server_label_falls_back_to_host():
+    assert (
+        handlers.server_label({"label": "Local", "base_url": "http://localhost:4096"})
+        == "Local · localhost:4096"
+    )
+    assert handlers.server_label({"label": "", "base_url": "http://a:1"}) == "a:1"
+
+
+@pytest.mark.asyncio
+async def test_server_command_lists_with_active_marked(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    db.set_user_server(111, second["id"])
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(update, _command_context(FakeClient(), args=[]))
+
+    markup = update.effective_message.reply_markups[-1]
+    assert markup is not None
+    data = _keyboard_data(markup)
+    assert "srv:use:1" in data
+    assert "srv:use:2" in data
+    assert "srv:add" in data
+
+
+@pytest.mark.asyncio
+async def test_server_command_empty_registry(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(update, _command_context(FakeClient(), args=[]))
+
+    assert handlers.SERVER_NONE_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_server_command_add_starts_credential_flow(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update,
+        _command_context(FakeClient(), args=["add", "http://new:4096", "New"]),
+    )
+
+    state = handlers.PENDING_SERVER_INPUT[111]
+    assert state["step"] == "username"
+    assert state["base_url"] == "http://new:4096"
+    assert state["label"] == "New"
+    assert state["username"] is None
+    assert db.get_server_by_url("http://new:4096") is None
+    assert (
+        handlers.SERVER_USERNAME_PROMPT_TEXT in update.effective_message.sent
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_command_add_invalid_url_persists_nothing(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["add", "not-a-url"])
+    )
+
+    assert db.list_servers() == []
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+    assert handlers.SERVER_INVALID_URL_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_server_command_add_unhealthy_persists_nothing(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    _patch_check_server(monkeypatch, False)
+
+    update = _update(text="pw")
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "password",
+        "base_url": "http://dead:4096",
+        "label": None,
+        "username": "alice",
+        "password": None,
+    }
+    await handlers.text_message(update, _context(FakeClient()))
+
+    assert db.list_servers() == []
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+    assert any("Cannot reach" in text for text in update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_check_server_does_not_block_event_loop(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    order: list[str] = []
+
+    async def slow_health(base_url, username, password):
+        await asyncio.sleep(0.2)
+        order.append("health")
+        return True
+
+    monkeypatch.setattr(handlers, "_check_server", slow_health)
+
+    async def competitor():
+        await asyncio.sleep(0.01)
+        order.append("competitor")
+
+    task = asyncio.create_task(competitor())
+    update = _update(text="pw")
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "password",
+        "base_url": "http://new:4096",
+        "label": "New",
+        "username": "alice",
+        "password": None,
+    }
+    await handlers.text_message(update, _context(FakeClient()))
+    await task
+
+    assert order == ["competitor", "health"]
+    assert db.get_server_by_url("http://new:4096") is not None
+
+
+@pytest.mark.asyncio
+async def test_server_command_use_switches_and_deletes_session(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    db.set_user_server(111, first["id"])
+    db.sessions[1] = {
+        "session_id": "ses_old",
+        "directory": "D:/repo",
+        "server_id": first["id"],
+    }
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["use", str(second["id"])])
+    )
+
+    assert db.user_servers[111] == second["id"]
+    assert 1 not in db.sessions
+    assert any("Switched to" in text for text in update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_server_command_use_same_server_keeps_session(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    db.set_user_server(111, first["id"])
+    db.sessions[1] = {
+        "session_id": "ses_old",
+        "directory": "D:/repo",
+        "server_id": first["id"],
+    }
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["use", str(first["id"])])
+    )
+
+    assert 1 in db.sessions
+    assert any("Already using" in text for text in update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_server_command_remove_requires_admin(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["remove", str(second["id"])])
+    )
+
+    assert db.get_server(second["id"]) is not None
+    assert handlers.SERVER_ADMIN_ONLY_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_server_command_remove_as_admin(monkeypatch):
+    admin_id = config.ADMIN_USER_ID
+    db = FakeDB(_row(telegram_id=admin_id))
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update(telegram_id=admin_id)
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["remove", str(second["id"])])
+    )
+
+    assert db.get_server(second["id"]) is None
+    assert any("Removed" in text for text in update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_server_command_usage_for_unknown_action(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["bogus"])
+    )
+
+    assert handlers.SERVER_USAGE_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_server_callback_add_sets_pending_input(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    query = FakeQuery("srv:add", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.server_callback(update, _context(FakeClient()))
+
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "url"
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited_once()
+    assert (
+        query.edit_message_text.await_args.args[0] == handlers.SERVER_ADD_PROMPT_TEXT
+    )
+
+
+@pytest.mark.asyncio
+async def test_server_callback_use_switches(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    db.set_user_server(111, first["id"])
+    db.sessions[1] = {
+        "session_id": "ses_old",
+        "directory": "D:/repo",
+        "server_id": first["id"],
+    }
+    monkeypatch.setattr(handlers, "database", db)
+    query = FakeQuery(f"srv:use:{second['id']}", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.server_callback(update, _context(FakeClient()))
+
+    assert db.user_servers[111] == second["id"]
+    assert 1 not in db.sessions
+    query.answer.assert_awaited()
+    query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_server_callback_remove_requires_admin(monkeypatch):
+    db = FakeDB(_row())
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    query = FakeQuery(f"srv:rm:{second['id']}", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.server_callback(update, _context(FakeClient()))
+
+    assert db.get_server(second["id"]) is not None
+    query.edit_message_text.assert_not_awaited()
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_server_callback_remove_as_admin(monkeypatch):
+    admin_id = config.ADMIN_USER_ID
+    db = FakeDB(_row(telegram_id=admin_id))
+    first = db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://host.docker.internal:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    query = FakeQuery(
+        f"srv:rm:{second['id']}", from_user=SimpleNamespace(id=admin_id)
+    )
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=admin_id)
+    )
+
+    await handlers.server_callback(update, _context(FakeClient()))
+
+    assert db.get_server(second["id"]) is None
+    query.edit_message_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_server_callback_unauthenticated_refused(monkeypatch):
+    db = FakeDB(_row(authenticated=0))
+    monkeypatch.setattr(handlers, "database", db)
+    query = FakeQuery("srv:add", from_user=SimpleNamespace(id=111))
+    update = SimpleNamespace(
+        callback_query=query, effective_user=SimpleNamespace(id=111)
+    )
+
+    await handlers.server_callback(update, _context(FakeClient()))
+
+    assert handlers.PENDING_SERVER_INPUT.get(111) is None
+    query.edit_message_text.assert_not_awaited()
+    assert query.answer.await_args.kwargs.get("show_alert") is True
+
+
+@pytest.mark.asyncio
+async def test_text_message_consumes_pending_server_url(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    _patch_check_server(monkeypatch, True)
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    update = _update(text="http://new:4096")
+    await handlers.text_message(update, _context(FakeClient()))
+
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "username"
+    assert handlers.PENDING_SERVER_INPUT[111]["base_url"] == "http://new:4096"
+    assert db.get_server_by_url("http://new:4096") is None
+
+
+@pytest.mark.asyncio
+async def test_text_message_invalid_url_at_url_step_keeps_flow(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+    client = FakeClient()
+
+    update = _update(text="nope")
+    await handlers.text_message(update, _context(client))
+
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "url"
+    assert handlers.SERVER_INVALID_URL_TEXT in update.effective_message.sent
+    assert db.list_servers() == []
+    client.send_prompt.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_question_takes_precedence_over_pending_server_input(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    handlers.PENDING_QUESTIONS[111] = _question_state()
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    update = _update(text="my answer")
+    await handlers.text_message(update, _context(client))
+
+    client.reply_question.assert_awaited_once_with("que_1", [["my answer"]])
+    assert 111 not in handlers.PENDING_QUESTIONS
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "url"
+
+
+def test_client_returns_default_when_server_matches():
+    default = FakeClient()
+    context = SimpleNamespace(bot_data={"opencode": default}, bot=AsyncMock())
+    server = {
+        "id": 1,
+        "label": "L",
+        "base_url": handlers.config.OPENCODE_BASE_URL,
+    }
+
+    assert handlers._client(context, server) is default
+    assert handlers._client(context, None) is default
+
+
+def test_client_returns_registry_client_for_custom_server(monkeypatch):
+    created: list[str] = []
+
+    class _StubClient:
+        def __init__(self, base_url=None, **kwargs):
+            self.base_url = base_url
+            created.append(base_url)
+
+    monkeypatch.setattr(handlers, "OpenCodeClient", _StubClient)
+    default = FakeClient()
+    context = SimpleNamespace(bot_data={"opencode": default}, bot=AsyncMock())
+    server = {"id": 2, "label": "R", "base_url": "http://other:4096"}
+
+    client = handlers._client(context, server)
+    assert client is not default
+    assert client.base_url == "http://other:4096"
+    assert context.bot_data["opencode_clients"]["http://other:4096"] is client
+
+    assert handlers._client(context, server) is client
+    assert created == ["http://other:4096"]
+
+
+def test_server_id_for_client_resolves_registered_server(monkeypatch):
+    db = FakeDB(_row())
+    server = db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+
+    assert handlers._server_id_for_client(FakeClient()) == server["id"]
+
+
+@pytest.mark.asyncio
+async def test_permission_event_records_server_base_url(monkeypatch):
+    row = _row()
+    db = FakeDB(row)
+    db.get_user_by_session_id = lambda session_id: row
+    monkeypatch.setattr(handlers, "database", db)
+    bot = SimpleNamespace(send_message=AsyncMock())
+    client = FakeClient()
+    client.base_url = "http://other:4096"
+    event = {
+        "type": "permission.asked",
+        "properties": {"id": "per_9", "sessionID": "ses_1", "permission": "bash"},
+    }
+
+    await handlers.handle_event(event, bot=bot, client=client)
+
+    assert handlers.PERMISSION_SERVERS["per_9"] == "http://other:4096"
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_resolves_client_inside_lock(monkeypatch):
+    db = FakeDB(_row())
+    server = db.add_server("Local", "http://localhost:4096")
+    db.set_user_server(111, int(server["id"]))
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    real_lock = asyncio.Lock()
+    observed: list[tuple[str, bool]] = []
+
+    class RecordingLock:
+        async def __aenter__(self):
+            await real_lock.acquire()
+            observed.append(("lock", True))
+
+        async def __aexit__(self, *exc):
+            real_lock.release()
+
+    monkeypatch.setattr(handlers, "_lock_for", lambda telegram_id: RecordingLock())
+
+    def fake_client(context, server_row=None):
+        observed.append(("client", real_lock.locked()))
+        return client
+
+    monkeypatch.setattr(handlers, "_client", fake_client)
+
+    update = _update(text="hi")
+    await handlers._process_prompt(update, _context(client), db.row, "hi")
+
+    assert observed == [("lock", True), ("client", True)]
+
+
+def test_parse_server_url_with_embedded_credentials():
+    url, username, password = handlers.parse_server_url_with_credentials(
+        "http://alice:s3cret@host:4096"
+    )
+    assert url == "http://host:4096"
+    assert username == "alice"
+    assert password == "s3cret"
+
+
+def test_parse_server_url_without_credentials():
+    assert handlers.parse_server_url_with_credentials("http://host:4096/") == (
+        "http://host:4096",
+        None,
+        None,
+    )
+    assert handlers.parse_server_url_with_credentials("nope") is None
+    assert handlers.parse_server_url_with_credentials("ftp://host") is None
+
+
+def test_server_credentials_label_masks_secret():
+    assert (
+        handlers.server_credentials_label(
+            {"username": "alice", "password": "s3cret"}
+        )
+        == " · 🔒 alice"
+    )
+    assert (
+        handlers.server_credentials_label({"username": None, "password": "tok"})
+        == " · 🔒 token"
+    )
+    assert handlers.server_credentials_label({"username": None, "password": None}) == ""
+    assert (
+        "s3cret"
+        not in handlers.server_credentials_label(
+            {"username": "alice", "password": "s3cret"}
+        )
+    )
+    assert (
+        "s3cr3t-token-value"
+        not in handlers.server_credentials_label(
+            {"username": None, "password": "s3cr3t-token-value"}
+        )
+    )
+
+
+def test_server_label_includes_masked_credentials():
+    row = {
+        "label": "Local",
+        "base_url": "http://h:1",
+        "username": "alice",
+        "password": "s3cret",
+    }
+    assert handlers.server_label(row) == "Local · h:1 · 🔒 alice"
+
+
+@pytest.mark.asyncio
+async def test_server_command_list_masks_credentials(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server(
+        "Local", "http://localhost:4096", username="alice", password="s3cret"
+    )
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update()
+    await handlers.server_command(
+        update, _command_context(FakeClient(), args=["list"])
+    )
+
+    labels = _keyboard_labels(update.effective_message.reply_markups[-1])
+    assert any("🔒 alice" in label for label in labels)
+    assert not any("s3cret" in label for label in labels)
+    assert "s3cret" not in "\n".join(update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_server_add_flow_basic_persists_and_selects(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    calls: list = []
+    _patch_check_server(monkeypatch, True, calls)
+    context = _context(FakeClient())
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": "New",
+        "username": None,
+        "password": None,
+    }
+
+    url_update = _update(text="http://new:4096")
+    await handlers.text_message(url_update, context)
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "username"
+    assert (
+        handlers.SERVER_USERNAME_PROMPT_TEXT in url_update.effective_message.sent
+    )
+
+    user_update = _update(text="alice")
+    await handlers.text_message(user_update, context)
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "password"
+    assert (
+        handlers.SERVER_PASSWORD_PROMPT_TEXT in user_update.effective_message.sent
+    )
+
+    pass_update = _update(text="s3cret")
+    await handlers.text_message(pass_update, context)
+
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+    created = db.get_server_by_url("http://new:4096")
+    assert created is not None
+    assert created["username"] == "alice"
+    assert created["password"] == "s3cret"
+    assert db.user_servers[111] == created["id"]
+    assert calls == [("http://new:4096", "alice", "s3cret")]
+    pass_update.effective_message.delete.assert_awaited_once()
+    assert not any("s3cret" in text for text in pass_update.effective_message.sent)
+    assert any("🔒 alice" in text for text in pass_update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_server_add_flow_skip_username_uses_bearer(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    calls: list = []
+    _patch_check_server(monkeypatch, True, calls)
+    context = _context(FakeClient())
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    await handlers.text_message(_update(text="http://new:4096"), context)
+    await handlers.text_message(_update(text="/skip"), context)
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "token"
+
+    await handlers.text_message(_update(text="tok123"), context)
+
+    created = db.get_server_by_url("http://new:4096")
+    assert created is not None
+    assert created["username"] is None
+    assert created["password"] == "tok123"
+    assert calls == [("http://new:4096", None, "tok123")]
+
+
+@pytest.mark.asyncio
+async def test_server_add_flow_skip_at_token_means_no_auth(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    calls: list = []
+    _patch_check_server(monkeypatch, True, calls)
+    context = _context(FakeClient())
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    await handlers.text_message(_update(text="http://new:4096"), context)
+    await handlers.text_message(_update(text="/skip"), context)
+    await handlers.text_message(_update(text="/skip"), context)
+
+    created = db.get_server_by_url("http://new:4096")
+    assert created is not None
+    assert created["username"] is None
+    assert created["password"] is None
+    assert calls == [("http://new:4096", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_server_add_flow_cancel_command_clears(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = _server_state("username")
+
+    update = _update(text="/cancel")
+    await handlers.cancel_command(update, _command_context(FakeClient()))
+
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+    assert handlers.SERVER_CANCELLED_TEXT in update.effective_message.sent
+    assert db.list_servers() == []
+
+
+@pytest.mark.asyncio
+async def test_server_add_flow_cancel_literal_clears(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = _server_state("url")
+
+    update = _update(text="cancel")
+    await handlers.text_message(update, _context(FakeClient()))
+
+    assert 111 not in handlers.PENDING_SERVER_INPUT
+    assert handlers.SERVER_CANCELLED_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_skip_command_without_flow(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update(text="/skip")
+    await handlers.skip_command(update, _command_context(FakeClient()))
+
+    assert handlers.SERVER_NOTHING_TO_SKIP_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_cancel_command_without_flow(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+
+    update = _update(text="/cancel")
+    await handlers.cancel_command(update, _command_context(FakeClient()))
+
+    assert handlers.SERVER_NOTHING_TO_CANCEL_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_skip_command_advances_username_to_token(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "username",
+        "base_url": "http://new:4096",
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    update = _update(text="/skip")
+    await handlers.skip_command(update, _command_context(FakeClient()))
+
+    assert handlers.PENDING_SERVER_INPUT[111]["step"] == "token"
+    assert handlers.SERVER_TOKEN_PROMPT_TEXT in update.effective_message.sent
+
+
+@pytest.mark.asyncio
+async def test_server_add_url_step_extracts_embedded_credentials(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "url",
+        "base_url": None,
+        "label": None,
+        "username": None,
+        "password": None,
+    }
+
+    update = _update(text="http://bob:pw@host:4096")
+    await handlers.text_message(update, _context(FakeClient()))
+
+    state = handlers.PENDING_SERVER_INPUT[111]
+    assert state["base_url"] == "http://host:4096"
+    assert state["username"] == "bob"
+    assert state["password"] == "pw"
+    assert state["step"] == "username"
+    assert not any("pw" in text for text in update.effective_message.sent)
+
+
+@pytest.mark.asyncio
+async def test_finalize_server_add_invalidates_client_cache(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    _patch_check_server(monkeypatch, True)
+    context = _context(FakeClient())
+    stale = object()
+    context.bot_data["opencode_clients"] = {"http://new:4096": stale}
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "password",
+        "base_url": "http://new:4096",
+        "label": None,
+        "username": "alice",
+        "password": None,
+    }
+
+    await handlers.text_message(_update(text="pw"), context)
+
+    assert "http://new:4096" not in context.bot_data["opencode_clients"]
+
+
+@pytest.mark.asyncio
+async def test_remove_server_invalidates_client_cache(monkeypatch):
+    admin_id = config.ADMIN_USER_ID
+    db = FakeDB(_row(telegram_id=admin_id))
+    db.add_server("Local", "http://localhost:4096")
+    second = db.add_server("Remote", "http://remote:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    context = _command_context(
+        FakeClient(), args=["remove", str(second["id"])]
+    )
+    context.bot_data["opencode_clients"] = {"http://remote:4096": object()}
+
+    await handlers.server_command(
+        _update(telegram_id=admin_id), context
+    )
+
+    assert "http://remote:4096" not in context.bot_data["opencode_clients"]
+
+
+def test_client_for_base_url_uses_stored_credentials(monkeypatch):
+    db = FakeDB(_row())
+    db.add_server(
+        "R", "http://other:4096", username="alice", password="s3cret"
+    )
+    monkeypatch.setattr(handlers, "database", db)
+    captured: dict = {}
+
+    class _StubClient:
+        def __init__(self, base_url=None, **kwargs):
+            self.base_url = base_url
+            captured["base_url"] = base_url
+            captured["username"] = kwargs.get("username")
+            captured["password"] = kwargs.get("password")
+
+    monkeypatch.setattr(handlers, "OpenCodeClient", _StubClient)
+    default = FakeClient()
+    context = SimpleNamespace(bot_data={"opencode": default}, bot=AsyncMock())
+    server = {"id": 2, "label": "R", "base_url": "http://other:4096"}
+
+    client = handlers._client(context, server)
+
+    assert client is not default
+    assert captured == {
+        "base_url": "http://other:4096",
+        "username": "alice",
+        "password": "s3cret",
+    }
+
+
+@pytest.mark.asyncio
+async def test_check_server_uses_credentials(monkeypatch):
+    captured: dict = {}
+
+    class _StubClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def health(self):
+            return True
+
+        async def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(handlers, "OpenCodeClient", _StubClient)
+
+    assert await handlers._check_server("http://x", "u", "p") is True
+    assert captured["base_url"] == "http://x"
+    assert captured["username"] == "u"
+    assert captured["password"] == "p"
+    assert captured["timeout"] == 5.0
+    assert captured["closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_server_add_logging_never_includes_secret(monkeypatch, caplog):
+    db = FakeDB(_row())
+    db.add_server("Local", "http://localhost:4096")
+    monkeypatch.setattr(handlers, "database", db)
+    _patch_check_server(monkeypatch, True)
+    context = _context(FakeClient())
+    handlers.PENDING_SERVER_INPUT[111] = {
+        "step": "password",
+        "base_url": "http://new:4096",
+        "label": None,
+        "username": "alice",
+        "password": None,
+    }
+
+    with caplog.at_level(logging.INFO):
+        await handlers.text_message(_update(text="topsecret"), context)
+
+    assert "topsecret" not in caplog.text

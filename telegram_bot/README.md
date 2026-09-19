@@ -30,7 +30,7 @@ Configuration keys:
 | `STT_API_KEY`        | OpenRouter key (required for voice input).        |
 | `STT_MODEL`          | OpenRouter transcription model slug.              |
 | `TTS_VOICE` etc.     | Edge TTS voice/rate/volume/pitch defaults.        |
-| `OPENCODE_BASE_URL`  | Local opencode server (default `:4096`).          |
+| `OPENCODE_BASE_URL`  | Default opencode server (default `:4096`), registered as the `Local` server. |
 | `OPENCODE_DIRECTORY` | Working directory for opencode sessions.          |
 | `OPENCODE_AGENT`     | Agent used for prompts (default `build`).         |
 | `OPENCODE_TIMEOUT`   | Seconds for a blocking prompt (default `600`).    |
@@ -88,12 +88,14 @@ cloudflared.
   persists it as the model used by subsequent prompts.
 - `/session` - list sessions for the current working directory and switch the
   active one (or start a new session).
-- `/workdir` - open the directory browser at the current working directory.
-- `/workdir <path>` - open the browser at a validated directory; pick
+- `/workdir` - open the directory browser at the current working directory (on
+  the selected opencode server).
+- `/workdir <path>` - open the browser at a server path; pick
   `✅ Use this directory` to set it and start a fresh session there.
 - `/compact` - compact (summarize) the active session.
 - `/mcp` - list MCP servers with their status and the available tool ids.
 - `/status` - show the status of the ongoing opencode task.
+- `/server` - list, add, or switch opencode servers.
 - `/list` - your 20 most recent stored media, each as a tappable button.
 - `/get <id>` - resend a stored media item by its id.
 
@@ -108,6 +110,30 @@ the storage confirmation.
 
 opencode features require `is_authenticated = 1`; unauthenticated users get an
 access-pending message (voice media is still stored first).
+
+## User approval (Phase 2)
+
+New users are created with `is_authenticated = 0`. A gate registered in handler
+group `-1` runs before every other message handler:
+
+- If the sender is the bot admin (`ADMIN_USER_ID`) or an authenticated user, the
+  update passes through to the normal handlers.
+- Otherwise the user row is created/updated and, on the first time only, the bot
+  DMs the admin an access request (display name, `@username`, numeric Telegram
+  id, `language_code`) with **✅ Approve** (`auth:ok:<id>`) and **🚫 Reject**
+  (`auth:no:<id>`) buttons. The pending timestamp is stored in
+  `users.approval_requested_at`.
+- `/start` and `/id` (optionally suffixed with `@botname`) are allowed; any other
+  message gets the access-pending reply and is stopped with
+  `ApplicationHandlerStop` so it never reaches the real handler.
+
+Tapping a button runs `auth_callback`: only the admin may decide (others are
+answered "Not authorized" and no DB change is made). Approve sets
+`is_authenticated = 1` and clears the pending flag; Reject keeps the user
+unauthenticated and clears the flag (so a later message re-notifies the admin).
+Either way the admin message is edited to the decision and the user is DMed
+(best-effort). The request is sent once per pending state; if the admin has not
+started the bot the send fails and the flag is not set, so it can be retried.
 
 ## Voice mode
 
@@ -232,18 +258,63 @@ state.
 ## Sessions
 
 One persistent opencode session is stored per user in `opencode_sessions`
-together with its working directory. `/new` deletes the stored mapping so the
-next prompt creates a fresh session. `/session` lists sessions for the current
-working directory and lets the user switch the active one.
+together with its working directory and the server that hosts it. `/new` deletes
+the stored mapping so the next prompt creates a fresh session. `/session` lists
+sessions for the current working directory and lets the user switch the active
+one.
+
+## Custom servers (Phase 11)
+
+`OPENCODE_BASE_URL` (default `http://localhost:4096`) is registered as the
+default `Local` server at startup (`ensure_default_server`). Authenticated users
+can register more servers and switch between them:
+
+- `/server` renders every server as an inline button (`srv:use:<id>`, active one
+  marked `✅`), a `➕ Add server` button (`srv:add`), and — for admins — remove
+  buttons (`srv:rm:<id>`). Two buttons per row.
+- `/server add <url> [label]` validates the URL (`normalize_server_url`: requires
+  `http`/`https` plus a host, trailing `/` stripped), then starts an interactive
+  credential prompt (username → password). `srv:add` does the same starting from
+  the URL. At each step `/skip` leaves the field empty and `/cancel` (or the
+  literal words `skip`/`cancel`) aborts; a pending `question` always wins first,
+  and any other command aborts the flow. Embedded `user:pass@` credentials in a
+  URL are extracted and stripped from the stored URL.
+- The final health check (`_check_server`) runs asynchronously **with the
+  supplied credentials**; invalid or unreachable servers are rejected without
+  being persisted, then the server is added and selected.
+- Credentials are optional: a username selects HTTP **Basic** auth (empty
+  password allowed), a secret with no username selects **Bearer**. They are
+  stored plaintext in the gitignored SQLite DB, never logged or echoed, and are
+  masked in listings as `🔒 <username>` / `🔒 token`. The password message is
+  deleted (best-effort) after it is read.
+- Servers are health-checked synchronously from the bot host (via a worker
+  thread), so only add hosts you trust — the bot will make an outbound request to
+  whatever URL you supply.
+- `/server use <id>` and `srv:use:<id>` switch the user's active server. If it
+  differs from the current one, the stored opencode session is deleted so a fresh
+  session starts on the new server, and the SSE supervisor is refreshed.
+- `/server remove <id>` and `srv:rm:<id>` are **admin only**; they detach users
+  on that server, drop its sessions, and refuse to delete the last server.
+  `/server list` (and any other action) is available to every authenticated user.
+
+Clients are cached per base URL in `bot_data["opencode_clients"]` via
+`_client(context, server_row)`; the default client is used whenever the resolved
+server matches `OPENCODE_BASE_URL`. Event listeners are keyed by
+`(base_url, directory)` so questions/permissions from every server are surfaced,
+and permission replies are routed back to the server that asked. A server in a
+Docker container reaches the host via `http://host.docker.internal:4096` (or a
+LAN URL).
 
 ## Command palette (Phase 3.5)
 
 - `/models` fetches connected providers and their models, renders them as
-  paginated inline buttons (8 per page) and stores `model_provider` /
-  `model_id` per user. The next prompt sends `{"providerID","modelID"}` to
-  opencode. Because provider/model ids can exceed Telegram's 64-byte
-  `callback_data` limit, buttons carry a short token (`mdl:m0`, `mdl:pg:1`) that
-  maps to the full id in memory.
+  paginated inline buttons (8 per page) and stores the selection **per
+  (user, server)** in `user_models` (the default server also mirrors
+  `users.model_provider` / `users.model_id`). Switching servers never carries a
+  model over; an unset server uses its default until one is chosen. The next
+  prompt sends `{"providerID","modelID"}` to opencode. Because provider/model
+  ids can exceed Telegram's 64-byte `callback_data` limit, buttons carry a short
+  token (`mdl:m0`, `mdl:pg:1`) that maps to the full id in memory.
 - `/workdir` opens an interactive directory browser (see below).
 - `/compact` calls `POST /api/session/{id}/compact` for the active session.
 - `/mcp` shows each MCP server with its connection status plus the tool ids
@@ -251,29 +322,43 @@ working directory and lets the user switch the active one.
 
 ## Working-directory browser (Phase 3.6)
 
-`/workdir` (no argument) opens the browser at the user's current workdir;
-`/workdir <path>` expands `~`, resolves the path, and opens the browser there
-(rejecting paths that are not existing absolute directories). The browser shows
-the absolute path, the number of subdirectories, and a preview of up to eight
-files with the total file count.
+The working directory is a path **on the selected opencode server**, not on the
+bot host (the server may be macOS/Linux or Windows). It is stored **per
+(user, server)** in `user_workdirs`, so switching servers never carries a path
+over; a server with no stored workdir uses that server's default from `GET
+/path`. `/workdir` (no argument) opens the browser at the effective workdir;
+`/workdir <path>` opens the browser directly at `<path>` with no local
+validation — the server's listing is the validation. The browser shows the
+absolute path, the number of subdirectories, and a preview of up to eight files
+with the total file count, all from the server's
+`GET /file?path=<abs>&directory=<abs>` listing (ignored entries are hidden).
 
 Inline buttons:
 
-- `✅ Use this directory` (`wdir:use`) - persists `users.workdir`, creates a new
-  opencode session in that directory, and stores it.
+- `✅ Use this directory` (`wdir:use`) - validates the path via the server,
+  persists it for the caller's (user, server) pair (`user_workdirs`; the default
+  server also mirrors `users.workdir`), creates a new opencode session in that
+  directory, and stores it.
 - `📁 <name>` (`wdir:o:<index>`) - navigate into a child directory. The index is
   the position within the in-memory child list, so the callback data stays well
   under Telegram's 64-byte limit.
 - `⬅️ Prev` / `Next ➡️` (`wdir:pg:<n>`) - page through children (12 per page);
   omitted at the ends.
-- `⬆️ Parent` (`wdir:up`) - go to the parent directory; omitted at a filesystem
-  root.
+- `⬆️ Parent` (`wdir:up`) - go to the parent directory (handles POSIX and Windows
+  separators); omitted at a filesystem root.
 - `🔄 Refresh` (`wdir:refresh`) - re-list the current directory.
 
 Browse state is kept in memory in `WORKDIR_BROWSE` keyed by Telegram id (owner,
-path, page, children), so it is lost when the bot restarts; pressing a stale
-button tells the user to run `/workdir` again. Buttons are bound to the user who
-opened the browser; other users are rejected.
+server base URL, path, page, children, files), so it is lost when the bot
+restarts; pressing a stale button tells the user to run `/workdir` again. Buttons
+are bound to the user who opened the browser; other users are rejected. A server
+error (non-2xx from `/file`, e.g. a missing directory) is shown as
+`❌ Could not browse <path>.`
+
+A stored workdir that is no longer browsable on the current server is healed:
+`ensure_session` and `/workdir` (no argument) fall back to that server's default
+(`GET /path`) and rewrite the stored value for that (user, server) pair; a stored
+session is reused only when both its server and its directory match.
 
 ## Task status (Phase 3.7)
 
