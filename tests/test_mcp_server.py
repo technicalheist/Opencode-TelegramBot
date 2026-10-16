@@ -64,3 +64,112 @@ def test_fallback_tools_call_unknown_tool():
     )
 
     assert response["result"]["isError"] is True
+
+
+def test_resolve_chat_id_from_session(monkeypatch, tmp_path):
+    target = tmp_path / "shot.png"
+    target.write_bytes(b"x")
+    fake_row = {"telegram_id": 424242}
+    monkeypatch.setattr(
+        mcp_server.database, "get_user_by_session_id", lambda sid: fake_row
+    )
+    captured = {}
+    send_file_mock = AsyncMock(return_value={"ok": True})
+
+    def capture_chat(path, *, chat_id, **kwargs):
+        captured["chat_id"] = chat_id
+        return send_file_mock()
+
+    monkeypatch.setattr(mcp_server, "send_file", capture_chat)
+    captured["chat_id"] = None
+
+    response = mcp_server._handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "telegram_send_file",
+                "arguments": {"path": str(target)},
+                "_meta": {"sessionID": "ses_abc"},
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert captured["chat_id"] == 424242
+
+
+def _capture_send_file(monkeypatch):
+    captured = {}
+
+    async def capture_chat(path, *, chat_id, **kwargs):
+        captured["chat_id"] = chat_id
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_server, "send_file", capture_chat)
+    captured["chat_id"] = "unset"
+    return captured
+
+
+def test_resolve_chat_id_without_session_uses_directory(monkeypatch, tmp_path):
+    target = tmp_path / "shot.png"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(
+        mcp_server.database, "get_chat_id_for_directory", lambda directory: 987654
+    )
+    captured = _capture_send_file(monkeypatch)
+
+    response = mcp_server._handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "telegram_send_file",
+                "arguments": {"path": str(target)},
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert captured["chat_id"] == 987654
+
+
+def test_resolve_chat_id_unknown_session_uses_directory(monkeypatch, tmp_path):
+    target = tmp_path / "shot.png"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(
+        mcp_server.database, "get_user_by_session_id", lambda sid: None
+    )
+    monkeypatch.setattr(
+        mcp_server.database, "get_chat_id_for_directory", lambda directory: 246810
+    )
+    captured = _capture_send_file(monkeypatch)
+
+    response = mcp_server._handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "telegram_send_file",
+                "arguments": {"path": str(target)},
+                "_meta": {"sessionID": "ses_unknown"},
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert captured["chat_id"] == 246810
+
+
+def test_resolve_chat_id_unresolved_returns_none(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server.database, "get_user_by_session_id", lambda sid: None
+    )
+    monkeypatch.setattr(
+        mcp_server.database, "get_chat_id_for_directory", lambda directory: None
+    )
+    assert mcp_server.resolve_chat_id(None) is None
+    assert mcp_server.resolve_chat_id("ses_unknown") is None

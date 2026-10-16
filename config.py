@@ -8,7 +8,11 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_FILE = ROOT_DIR / ".env"
 
-load_dotenv(ENV_FILE)
+# The root ``.env`` is the single source of truth for configuration; override
+# any value that happens to be exported in the shell so the bot, the launcher,
+# and the opencode server all agree (a stale exported OPENCODE_SERVER_PASSWORD
+# otherwise causes 401s).
+load_dotenv(ENV_FILE, override=True)
 
 PLACEHOLDER_VALUES = {
     "",
@@ -86,7 +90,23 @@ OPENCODE_DIRECTORY: Path = _resolve_path(os.getenv("OPENCODE_DIRECTORY"), ".")
 OPENCODE_AGENT: str = _env("OPENCODE_AGENT", "build")
 OPENCODE_TIMEOUT: float = _parse_opencode_timeout()
 OPENCODE_SERVE_COMMAND: str = _env("OPENCODE_SERVE_COMMAND", "opencode")
+# opencode v2 protects `serve`/`web` with HTTP basic auth when a password is set.
+# The username defaults to "opencode" (opencode's own default). These credentials
+# apply to the default server (OPENCODE_BASE_URL) for localhost too.
+OPENCODE_SERVER_USERNAME: str = _env("OPENCODE_SERVER_USERNAME", "opencode")
+OPENCODE_SERVER_PASSWORD: str = _env("OPENCODE_SERVER_PASSWORD")
 MEDIA_MAX_MB: int = _parse_media_max_mb()
+
+
+def opencode_server_credentials() -> tuple[str, str] | None:
+    """Return ``(username, password)`` for the default server, or ``None``.
+
+    ``None`` when no password is configured, so callers can skip sending auth
+    to an unsecured server.
+    """
+    if not OPENCODE_SERVER_PASSWORD:
+        return None
+    return OPENCODE_SERVER_USERNAME or "opencode", OPENCODE_SERVER_PASSWORD
 
 
 def _parse_webhook_port() -> int:

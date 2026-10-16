@@ -25,7 +25,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4096
-HEALTH_PATHS = ("/global/health", "/api/health")
+# The spawned ``opencode serve`` binds every interface so clients on the LAN,
+# in Docker, or in WSL can reach it; health checks still use OPENCODE_BASE_URL.
+SERVE_HOSTNAME = "0.0.0.0"
+HEALTH_PATHS = ("/api/info", "/api/health", "/global/health")
 
 
 def parse_base_url(base_url: str) -> tuple[str, int]:
@@ -35,11 +38,20 @@ def parse_base_url(base_url: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def _health_auth() -> Optional[httpx.BasicAuth]:
+    credentials = config.opencode_server_credentials()
+    if credentials is None:
+        return None
+    username, password = credentials
+    return httpx.BasicAuth(username, password)
+
+
 def is_healthy(base_url: str, *, timeout: float = 2.0) -> bool:
     base = (base_url or "").rstrip("/")
+    auth = _health_auth()
     for path in HEALTH_PATHS:
         try:
-            response = httpx.get(f"{base}{path}", timeout=timeout)
+            response = httpx.get(f"{base}{path}", timeout=timeout, auth=auth)
         except Exception:
             return False
         if response.status_code >= 400:
@@ -48,12 +60,15 @@ def is_healthy(base_url: str, *, timeout: float = 2.0) -> bool:
             body = response.json()
         except Exception:
             continue
-        if isinstance(body, dict) and body.get("healthy") is True:
+        if not isinstance(body, dict):
+            continue
+        # v2 exposes ``/api/info`` (version/pid/urls); v1 used ``healthy``.
+        if body.get("healthy") is True or "version" in body or "pid" in body:
             return True
     return False
 
 
-def _find_pid_via_os(port: int) -> Optional[int]:
+def _find_pids_via_os(port: int) -> list[int]:
     if os.name == "nt":
         command = ["netstat", "-ano", "-p", "tcp"]
     else:
@@ -64,13 +79,14 @@ def _find_pid_via_os(port: int) -> Optional[int]:
         )
     except Exception:
         logger.warning("Could not inspect listening sockets for port %s", port)
-        return None
+        return []
+    pids: list[int] = []
     if os.name != "nt":
         for line in (result.stdout or "").splitlines():
             line = line.strip()
-            if line.isdigit():
-                return int(line)
-        return None
+            if line.isdigit() and int(line) not in pids:
+                pids.append(int(line))
+        return pids
     for line in (result.stdout or "").splitlines():
         parts = line.split()
         if len(parts) < 5 or parts[0].upper() != "TCP":
@@ -82,17 +98,21 @@ def _find_pid_via_os(port: int) -> Optional[int]:
             continue
         local_port = local_address.rsplit(":", 1)[1]
         if local_port == str(port) and parts[4].isdigit():
-            return int(parts[4])
-    return None
+            pid = int(parts[4])
+            if pid not in pids:
+                pids.append(pid)
+    return pids
 
 
-def find_listening_pid(port: int) -> Optional[int]:
+def find_listening_pids(port: int) -> list[int]:
+    """Return every PID listening on ``port`` (across IPv4/IPv6 interfaces)."""
     try:
         import psutil
     except Exception:
         psutil = None
     if psutil is not None:
         try:
+            pids: list[int] = []
             for connection in psutil.net_connections(kind="tcp"):
                 laddr = getattr(connection, "laddr", None)
                 if laddr is None:
@@ -101,11 +121,19 @@ def find_listening_pid(port: int) -> Optional[int]:
                     getattr(laddr, "port", None) == port
                     and getattr(connection, "status", None) == psutil.CONN_LISTEN
                     and connection.pid
+                    and int(connection.pid) not in pids
                 ):
-                    return int(connection.pid)
+                    pids.append(int(connection.pid))
+            if pids:
+                return pids
         except Exception:
             logger.warning("psutil net_connections failed; using OS fallback")
-    return _find_pid_via_os(port)
+    return _find_pids_via_os(port)
+
+
+def find_listening_pid(port: int) -> Optional[int]:
+    pids = find_listening_pids(port)
+    return pids[0] if pids else None
 
 
 def _kill_pid_os(pid: int) -> None:
@@ -160,7 +188,7 @@ def _terminate_pid_tree(pid: int) -> None:
 def _wait_for_port_free(port: int, *, timeout: float = 10.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if find_listening_pid(port) is None:
+        if not find_listening_pids(port):
             return True
         time.sleep(0.25)
     return False
@@ -168,13 +196,23 @@ def _wait_for_port_free(port: int, *, timeout: float = 10.0) -> bool:
 
 def stop_existing_server(base_url: str, port: int) -> bool:
     try:
-        pid = find_listening_pid(port)
-        if pid is None:
+        pids = find_listening_pids(port)
+        if not pids:
             return False
-        logger.info("Stopping existing opencode server on port %s (pid %s)", port, pid)
-        _terminate_pid_tree(pid)
+        logger.info(
+            "Stopping existing opencode server(s) on port %s (pids %s)",
+            port,
+            ", ".join(str(pid) for pid in pids),
+        )
+        for pid in pids:
+            _terminate_pid_tree(pid)
         if not _wait_for_port_free(port):
-            logger.warning("Port %s still reported as listening after stop", port)
+            remaining = find_listening_pids(port)
+            logger.warning(
+                "Port %s still reported as listening after stop (pids %s)",
+                port,
+                ", ".join(str(pid) for pid in remaining) or "unknown",
+            )
         return True
     except Exception:
         logger.exception("Failed while stopping existing server on port %s", port)
@@ -207,8 +245,26 @@ def _popen_kwargs() -> dict:
     return {"start_new_session": True}
 
 
-def start_server(command: list[str]) -> subprocess.Popen:
-    return subprocess.Popen(command, cwd=str(_ROOT), **_popen_kwargs())
+def server_env() -> dict:
+    """Environment for the opencode server, ensuring v2 basic auth is enabled.
+
+    ``config`` reads ``OPENCODE_SERVER_PASSWORD`` from the root ``.env``; pass it
+    explicitly so a freshly spawned ``opencode serve`` always enables auth even
+    if the variable was only loaded by python-dotenv (not exported).
+    """
+    env = os.environ.copy()
+    credentials = config.opencode_server_credentials()
+    if credentials is not None:
+        username, password = credentials
+        env["OPENCODE_SERVER_USERNAME"] = username
+        env["OPENCODE_SERVER_PASSWORD"] = password
+    return env
+
+
+def start_server(command: list[str], *, env: Optional[dict] = None) -> subprocess.Popen:
+    return subprocess.Popen(
+        command, cwd=str(_ROOT), env=env or server_env(), **_popen_kwargs()
+    )
 
 
 def wait_for_health(
@@ -246,7 +302,7 @@ def build_cloudflared_command() -> Optional[list[str]]:
 
 
 def start_cloudflared(command: list[str]) -> subprocess.Popen:
-    return start_server(command)
+    return start_server(command, env=os.environ.copy())
 
 
 def wait_for_tunnel(
@@ -292,7 +348,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     base_url = config.OPENCODE_BASE_URL
-    host, port = parse_base_url(base_url)
+    _, port = parse_base_url(base_url)
     try:
         result = opencode_setup.install_all()
         logger.info("opencode setup install result: %s", result)
@@ -302,8 +358,8 @@ def main() -> int:
     cloudflared_process: Optional[subprocess.Popen] = None
     try:
         stop_existing_server(base_url, port)
-        command = build_serve_command(host, port)
-        logger.info("Starting opencode server on %s:%s", host, port)
+        command = build_serve_command(SERVE_HOSTNAME, port)
+        logger.info("Starting opencode server on %s:%s", SERVE_HOSTNAME, port)
         process = start_server(command)
         if not wait_for_health(base_url):
             logger.error("opencode server did not become healthy at %s", base_url)

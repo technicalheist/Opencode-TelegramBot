@@ -105,11 +105,10 @@ def test_desired_event_subscriptions_includes_default_and_sessions(
 
     subscriptions = bot.desired_event_subscriptions()
 
-    assert ("http://localhost:4096", str(config_dir)) in subscriptions
-    assert ("http://other:4096", "D:/jcp") in subscriptions
-    assert ("http://localhost:4096", "D:/other") in subscriptions
-    assert ("http://x:1", "D:/unauthed") not in subscriptions
-    assert not any(directory == "" for _, directory in subscriptions)
+    assert "http://localhost:4096" in subscriptions
+    assert "http://other:4096" in subscriptions
+    assert "http://y:1" in subscriptions
+    assert "http://x:1" not in subscriptions
 
 
 def test_desired_event_subscriptions_tolerates_db_error(monkeypatch, tmp_path):
@@ -123,23 +122,21 @@ def test_desired_event_subscriptions_tolerates_db_error(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bot, "database", _BrokenDB())
 
-    assert bot.desired_event_subscriptions() == {
-        ("http://localhost:4096", str(config_dir))
-    }
+    assert bot.desired_event_subscriptions() == {"http://localhost:4096"}
 
 
 def test_reconcile_event_tasks_adds_and_keeps_existing():
     application = _FakeApplication()
-    subscriptions = {("http://a:1", "x"), ("http://b:2", "y")}
+    subscriptions = {"http://a:1", "http://b:2"}
 
     bot.reconcile_event_tasks(application, subscriptions)
     assert set(application.bot_data["event_tasks"]) == {
-        "http://a:1::x",
-        "http://b:2::y",
+        "http://a:1",
+        "http://b:2",
     }
     assert sorted(application.created) == [
-        "events:http://a:1::x",
-        "events:http://b:2::y",
+        "events:http://a:1",
+        "events:http://b:2",
     ]
 
     application.created.clear()
@@ -149,15 +146,13 @@ def test_reconcile_event_tasks_adds_and_keeps_existing():
 
 def test_reconcile_event_tasks_cancels_removed():
     application = _FakeApplication()
-    bot.reconcile_event_tasks(
-        application, {("http://a:1", "x"), ("http://b:2", "y")}
-    )
-    task_a = application.bot_data["event_tasks"]["http://a:1::x"]
+    bot.reconcile_event_tasks(application, {"http://a:1", "http://b:2"})
+    task_a = application.bot_data["event_tasks"]["http://a:1"]
 
-    bot.reconcile_event_tasks(application, {("http://b:2", "y")})
+    bot.reconcile_event_tasks(application, {"http://b:2"})
 
     assert task_a.cancelled is True
-    assert set(application.bot_data["event_tasks"]) == {"http://b:2::y"}
+    assert set(application.bot_data["event_tasks"]) == {"http://b:2"}
 
 
 @pytest.mark.asyncio
@@ -167,7 +162,7 @@ async def test_listen_events_uses_per_base_url_client(monkeypatch):
     def fake_client_for_base_url(context, base_url):
         calls.append(base_url)
 
-        async def stream_events(directory=None):
+        async def stream_events():
             raise asyncio.CancelledError()
             yield  # pragma: no cover
 
@@ -179,7 +174,7 @@ async def test_listen_events_uses_per_base_url_client(monkeypatch):
     application = SimpleNamespace(bot_data={}, bot=SimpleNamespace())
 
     with pytest.raises(asyncio.CancelledError):
-        await bot._listen_events(application, "http://other:4096", "D:/x")
+        await bot._listen_events(application, "http://other:4096")
 
     assert calls == ["http://other:4096"]
 

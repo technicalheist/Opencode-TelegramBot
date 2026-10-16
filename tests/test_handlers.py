@@ -100,6 +100,11 @@ class FakeClient:
             return_value=str(handlers.config.OPENCODE_DIRECTORY)
         )
         self.list_directory = AsyncMock(return_value=[])
+        self.reply_form = AsyncMock()
+        self.cancel_form = AsyncMock()
+        self.list_forms = AsyncMock(return_value=[])
+        self.list_permissions = AsyncMock(return_value=[])
+        self.stream_events = None
 
 
 class FakeDB:
@@ -353,6 +358,7 @@ def _clear_locks():
     handlers.PENDING_QUESTIONS.clear()
     handlers.PENDING_SERVER_INPUT.clear()
     handlers.PERMISSION_SERVERS.clear()
+    handlers.PERMISSION_SESSIONS.clear()
     yield
     handlers.USER_LOCKS.clear()
     handlers.MODEL_CHOICES.clear()
@@ -363,6 +369,8 @@ def _clear_locks():
     handlers.PENDING_QUESTIONS.clear()
     handlers.PENDING_SERVER_INPUT.clear()
     handlers.PERMISSION_SERVERS.clear()
+    handlers.PERMISSION_SESSIONS.clear()
+
 
 
 def test_split_message_at_exact_limit():
@@ -548,12 +556,12 @@ async def test_permission_event_sends_inline_keyboard(monkeypatch):
     bot = SimpleNamespace(send_message=AsyncMock())
     event = {
         "id": "evt_1",
-        "type": "permission.asked",
-        "properties": {
+        "type": "permission.v2.asked",
+        "data": {
             "id": "per_1",
             "sessionID": "ses_1",
-            "permission": "bash",
-            "patterns": ["git push"],
+            "action": "bash",
+            "resources": ["git push"],
         },
     }
     await handlers.handle_event(event, bot=bot, client=FakeClient())
@@ -589,6 +597,7 @@ async def test_unrelated_event_is_ignored(monkeypatch):
 @pytest.mark.asyncio
 async def test_permission_callback_replies_and_edits(monkeypatch):
     client = FakeClient()
+    handlers.PERMISSION_SESSIONS["per_1"] = "ses_1"
     query = SimpleNamespace(
         data="perm:always:per_1",
         answer=AsyncMock(),
@@ -599,7 +608,9 @@ async def test_permission_callback_replies_and_edits(monkeypatch):
 
     await handlers.permission_callback(update, _context(client))
 
-    client.reply_permission.assert_awaited_once_with("per_1", "always")
+    client.reply_permission.assert_awaited_once_with(
+        "per_1", "always", session_id="ses_1"
+    )
     query.answer.assert_awaited()
     edit_kwargs = query.edit_message_text.await_args.kwargs
     assert edit_kwargs["reply_markup"] is None
@@ -2678,6 +2689,81 @@ async def test_fetch_media_bytes_unsupported_scheme():
         await handlers._fetch_media_bytes("ftp://example.com/file.png", max_bytes=10)
 
 
+def test_media_url_auth_matches_client_origin():
+    client = SimpleNamespace(
+        base_url="http://localhost:4096",
+        auth="AUTH",
+        auth_headers={"Authorization": "Bearer x"},
+    )
+
+    assert handlers._media_url_auth(
+        client, "http://localhost:4096/file/content?path=/a.png"
+    ) == ("AUTH", {"Authorization": "Bearer x"})
+
+
+def test_media_url_auth_ignores_other_origins():
+    client = SimpleNamespace(
+        base_url="http://localhost:4096", auth="AUTH", auth_headers=None
+    )
+
+    assert handlers._media_url_auth(client, "https://evil.example/x.png") == (
+        None,
+        None,
+    )
+    assert handlers._media_url_auth(client, "data:image/png;base64,AAAA") == (
+        None,
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_media_bytes_http_forwards_auth(monkeypatch):
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "image/png"}
+
+        async def aiter_bytes(self):
+            yield b"hi"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["auth"] = kwargs.get("auth")
+            captured["headers"] = kwargs.get("headers")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url):
+            captured["url"] = url
+            return FakeStream()
+
+    monkeypatch.setattr(handlers.httpx, "AsyncClient", FakeClient)
+
+    data, mime = await handlers._fetch_media_bytes(
+        "http://localhost:4096/file/content?path=/a.png",
+        max_bytes=100,
+        auth="AUTH",
+        headers={"Authorization": "Bearer x"},
+    )
+
+    assert data == b"hi"
+    assert mime == "image/png"
+    assert captured["auth"] == "AUTH"
+    assert captured["headers"] == {"Authorization": "Bearer x"}
+
+
 @pytest.mark.asyncio
 async def test_send_outbound_media_file_part_image_photo(tmp_path):
     message = FakeMessage()
@@ -2696,6 +2782,26 @@ async def test_send_outbound_media_file_part_image_photo(tmp_path):
 
     assert len(message.photos) == 1
     assert message.documents == []
+
+
+@pytest.mark.asyncio
+async def test_send_outbound_media_snapshot_files(tmp_path):
+    media = tmp_path / "chart.png"
+    media.write_bytes(b"png")
+    message = FakeMessage()
+    parts = [
+        {
+            "type": "text",
+            "text": "done",
+            "snapshot": {"start": "a", "end": "b", "files": [str(media)]},
+        }
+    ]
+
+    await handlers._send_outbound_media(
+        message, session_id="ses_snap", directory=tmp_path, parts=parts, diff_files=[]
+    )
+
+    assert len(message.photos) == 1
 
 
 @pytest.mark.asyncio
@@ -3010,7 +3116,9 @@ async def test_question_callback_single_select_submits(monkeypatch):
 
     await handlers.question_callback(update, context)
 
-    client.reply_question.assert_awaited_once_with("que_1", [["Yes"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "Yes"}, session_id="ses_1"
+    )
     assert 111 not in handlers.PENDING_QUESTIONS
     assert query.answer.await_count == 1
     assert context.bot.edit_message_text.await_args.kwargs["text"] == (
@@ -3057,7 +3165,9 @@ async def test_question_callback_multi_toggle_then_done(monkeypatch):
         context,
     )
     assert done.answer.await_count == 1
-    client.reply_question.assert_awaited_once_with("que_1", [["A", "B"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": ["A", "B"]}, session_id="ses_1"
+    )
     assert 111 not in handlers.PENDING_QUESTIONS
 
 
@@ -3082,7 +3192,9 @@ async def test_question_callback_custom_then_text_message(monkeypatch):
     update = _update(text="my free answer")
     await handlers.text_message(update, context)
 
-    client.reply_question.assert_awaited_once_with("que_1", [["my free answer"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "my free answer"}, session_id="ses_1"
+    )
     client.send_prompt.assert_not_awaited()
     assert 111 not in handlers.PENDING_QUESTIONS
 
@@ -3101,8 +3213,8 @@ async def test_question_callback_skip_rejects(monkeypatch):
 
     await handlers.question_callback(update, context)
 
-    client.reject_question.assert_awaited_once_with("que_1")
-    client.reply_question.assert_not_awaited()
+    client.cancel_form.assert_awaited_once_with("que_1", session_id="ses_1")
+    client.reply_form.assert_not_awaited()
     assert 111 not in handlers.PENDING_QUESTIONS
     assert query.answer.await_count == 1
     assert context.bot.edit_message_text.await_args.kwargs["text"] == (
@@ -3122,7 +3234,7 @@ async def test_question_callback_expired_alerts(monkeypatch):
 
     await handlers.question_callback(update, _context(client))
 
-    client.reject_question.assert_not_awaited()
+    client.cancel_form.assert_not_awaited()
     assert query.answer.await_count == 1
     assert query.answer.await_args.kwargs.get("show_alert") is True
 
@@ -3140,7 +3252,7 @@ async def test_question_callback_unauthenticated_refused(monkeypatch):
 
     await handlers.question_callback(update, _context(client))
 
-    client.reject_question.assert_not_awaited()
+    client.cancel_form.assert_not_awaited()
     assert 111 in handlers.PENDING_QUESTIONS
     assert query.answer.await_args.kwargs.get("show_alert") is True
 
@@ -3155,11 +3267,23 @@ async def test_question_asked_event_sends_message(monkeypatch):
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=7))
     )
     event = {
-        "type": "question.asked",
-        "properties": {
-            "id": "que_1",
-            "sessionID": "ses_1",
-            "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}],
+        "type": "form.created",
+        "data": {
+            "form": {
+                "id": "frm_1",
+                "sessionID": "ses_1",
+                "title": "Questions",
+                "metadata": {"kind": "question"},
+                "fields": [
+                    {
+                        "key": "q0",
+                        "title": "Confirm",
+                        "description": "Proceed?",
+                        "type": "string",
+                        "options": [{"label": "Yes"}],
+                    }
+                ],
+            }
         },
     }
 
@@ -3167,6 +3291,7 @@ async def test_question_asked_event_sends_message(monkeypatch):
 
     bot.send_message.assert_awaited_once()
     assert 111 in handlers.PENDING_QUESTIONS
+    assert handlers.PENDING_QUESTIONS[111]["request_id"] == "frm_1"
     assert handlers.PENDING_QUESTIONS[111]["message_id"] == 7
     data = _all_callback_data(
         bot.send_message.await_args.kwargs["reply_markup"]
@@ -3182,8 +3307,15 @@ async def test_question_asked_event_ignores_unknown_session(monkeypatch):
 
     await handlers.handle_event(
         {
-            "type": "question.asked",
-            "properties": {"id": "que_1", "sessionID": "ses_unknown", "questions": []},
+            "type": "form.created",
+            "data": {
+                "form": {
+                    "id": "frm_1",
+                    "sessionID": "ses_unknown",
+                    "metadata": {"kind": "question"},
+                    "fields": [{"key": "q0", "type": "string", "title": "Q?"}],
+                }
+            },
         },
         bot=bot,
         client=FakeClient(),
@@ -3202,8 +3334,8 @@ async def test_question_replied_event_clears_state(monkeypatch):
 
     await handlers.handle_event(
         {
-            "type": "question.replied",
-            "properties": {"sessionID": "ses_1", "requestID": "que_1"},
+            "type": "form.replied",
+            "data": {"sessionID": "ses_1", "formID": "que_1"},
         },
         bot=bot,
         client=FakeClient(),
@@ -3226,12 +3358,22 @@ async def test_reconcile_questions_surfaces_pending(monkeypatch):
     ]
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
-    client.list_questions = AsyncMock(
+    client.list_forms = AsyncMock(
         return_value=[
             {
-                "id": "que_1",
+                "id": "frm_1",
                 "sessionID": "ses_1",
-                "questions": [{"question": "Proceed?", "options": [{"label": "Yes"}]}],
+                "title": "Questions",
+                "metadata": {"kind": "question"},
+                "fields": [
+                    {
+                        "key": "q0",
+                        "title": "Confirm",
+                        "description": "Proceed?",
+                        "type": "string",
+                        "options": [{"label": "Yes"}],
+                    }
+                ],
             }
         ]
     )
@@ -3242,7 +3384,7 @@ async def test_reconcile_questions_surfaces_pending(monkeypatch):
 
     await handlers.reconcile_questions(application)
 
-    client.list_questions.assert_awaited_once_with(directory="D:/x")
+    client.list_forms.assert_awaited_once_with(directory="D:/x")
     assert 111 in handlers.PENDING_QUESTIONS
     assert handlers.PENDING_QUESTIONS[111]["directory"] == "D:/x"
     bot.send_message.assert_awaited_once()
@@ -3264,7 +3406,7 @@ async def test_reconcile_questions_tolerates_client_errors(monkeypatch):
     ]
     monkeypatch.setattr(handlers, "database", db)
     client = FakeClient()
-    client.list_questions = AsyncMock(side_effect=OpenCodeError("boom"))
+    client.list_forms = AsyncMock(side_effect=OpenCodeError("boom"))
     application = SimpleNamespace(bot_data={"opencode": client}, bot=object())
 
     await handlers.reconcile_questions(application)
@@ -3290,7 +3432,7 @@ async def test_reconcile_questions_skips_unauthenticated(monkeypatch):
 
     await handlers.reconcile_questions(application)
 
-    client.list_questions.assert_not_awaited()
+    client.list_forms.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3304,8 +3446,8 @@ async def test_text_while_question_pending_is_consumed_as_custom_answer(monkeypa
     update = _update(text="typed instead of tapping")
     await handlers.text_message(update, context)
 
-    client.reply_question.assert_awaited_once_with(
-        "que_1", [["typed instead of tapping"]]
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "typed instead of tapping"}, session_id="ses_1"
     )
     client.send_prompt.assert_not_awaited()
     client.create_session.assert_not_awaited()
@@ -3326,7 +3468,9 @@ async def test_text_while_awaiting_text_is_consumed(monkeypatch):
     update = _update(text="my typed answer")
     await handlers.text_message(update, _context(client))
 
-    client.reply_question.assert_awaited_once_with("que_1", [["my typed answer"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "my typed answer"}, session_id="ses_1"
+    )
     client.send_prompt.assert_not_awaited()
     assert 111 not in handlers.PENDING_QUESTIONS
 
@@ -3343,7 +3487,9 @@ async def test_text_while_custom_question_pending_is_consumed(monkeypatch):
     update = _update(text="custom answer")
     await handlers.text_message(update, _context(client))
 
-    client.reply_question.assert_awaited_once_with("que_1", [["custom answer"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "custom answer"}, session_id="ses_1"
+    )
     client.send_prompt.assert_not_awaited()
 
 
@@ -3418,8 +3564,8 @@ async def test_question_callback_answer_passes_directory(monkeypatch):
 
     await handlers.question_callback(update, _context(client))
 
-    client.reply_question.assert_awaited_once_with(
-        "que_1", [["Yes"]], directory="D:/jcp"
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "Yes"}, session_id="ses_1"
     )
 
 
@@ -3436,7 +3582,7 @@ async def test_question_callback_skip_passes_directory(monkeypatch):
 
     await handlers.question_callback(update, _context(client))
 
-    client.reject_question.assert_awaited_once_with("que_1", directory="D:/jcp")
+    client.cancel_form.assert_awaited_once_with("que_1", session_id="ses_1")
 
 
 @pytest.mark.asyncio
@@ -4400,7 +4546,9 @@ async def test_question_takes_precedence_over_pending_server_input(monkeypatch):
     update = _update(text="my answer")
     await handlers.text_message(update, _context(client))
 
-    client.reply_question.assert_awaited_once_with("que_1", [["my answer"]])
+    client.reply_form.assert_awaited_once_with(
+        "que_1", {"q0": "my answer"}, session_id="ses_1"
+    )
     assert 111 not in handlers.PENDING_QUESTIONS
     assert handlers.PENDING_SERVER_INPUT[111]["step"] == "url"
 
@@ -4458,13 +4606,14 @@ async def test_permission_event_records_server_base_url(monkeypatch):
     client = FakeClient()
     client.base_url = "http://other:4096"
     event = {
-        "type": "permission.asked",
-        "properties": {"id": "per_9", "sessionID": "ses_1", "permission": "bash"},
+        "type": "permission.v2.asked",
+        "data": {"id": "per_9", "sessionID": "ses_1", "action": "bash"},
     }
 
     await handlers.handle_event(event, bot=bot, client=client)
 
     assert handlers.PERMISSION_SERVERS["per_9"] == "http://other:4096"
+    assert handlers.PERMISSION_SESSIONS["per_9"] == "ses_1"
 
 
 @pytest.mark.asyncio

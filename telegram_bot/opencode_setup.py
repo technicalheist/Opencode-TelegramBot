@@ -74,6 +74,9 @@ def _skill_text() -> str:
         "# Sending files to Telegram\n\n"
         "To send a file or image to the Telegram user, call the MCP tool:\n\n"
         '    telegram_send_file(path="<absolute path>", caption="<optional>")\n\n'
+        "The file goes to the Telegram user whose opencode session triggered "
+        "the call (resolved from the session, or from the session working "
+        "directory when the session id is unavailable).\n\n"
         "If the MCP tool is unavailable, run the CLI instead:\n\n"
         f'    "{sys.executable}" "{SEND_MEDIA_PATH}" "<absolute path>" '
         '--caption "<optional>"\n\n'
@@ -87,10 +90,11 @@ def _skill_text() -> str:
 
 
 def install_skill() -> bool:
-    if GLOBAL_SKILL.exists():
+    text = _skill_text()
+    if GLOBAL_SKILL.exists() and GLOBAL_SKILL.read_text(encoding="utf-8") == text:
         return False
     GLOBAL_SKILL.parent.mkdir(parents=True, exist_ok=True)
-    GLOBAL_SKILL.write_text(_skill_text(), encoding="utf-8")
+    GLOBAL_SKILL.write_text(text, encoding="utf-8")
     return True
 
 

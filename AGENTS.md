@@ -186,7 +186,11 @@ starts (skip if already present).
 - [ ] `telegram_bot/send_media.py` — CLI: `python -m telegram_bot.send_media
       <path> [--caption TEXT] [--chat-id ID]` sends a file via the Bot API.
 - [ ] `telegram_bot/mcp_server.py` — local stdio MCP server exposing a
-      `telegram_send_file(path, caption?)` tool (default chat = `ADMIN_USER_ID`).
+      `telegram_send_file(path, caption?)` tool. The recipient is resolved from
+      `CallToolRequest.params._meta.sessionID` when present, else from the
+      process working directory (= the opencode session directory) via the
+      `opencode_sessions` mapping; the tool never sends to the admin by default
+      (it errors when no recipient can be resolved).
 - [ ] `telegram_bot/opencode_setup.py` — on startup, best-effort and idempotent:
       merge `mcp.telegram` into `~/.config/opencode/opencode.json` and write
       `~/.config/opencode/skills/telegram-media/SKILL.md`; never corrupt an
@@ -206,7 +210,7 @@ installed MCP config/skill are loaded without a separate opencode restart.
       1. run `opencode_setup.install_all()` BEFORE starting the server;
       2. detect a running `opencode serve` on the configured port (health check
          and/or listening socket) and **kill it first** if present;
-      3. start `opencode serve --port <port> --hostname <host>` (port/host parsed
+      3. start `opencode serve --port <port> --hostname 0.0.0.0` (port parsed
          from `OPENCODE_BASE_URL`);
       4. wait until healthy, then run the bot;
       5. terminate the server we started on exit.
@@ -392,43 +396,71 @@ from opencode_client import OpenCodeClient, OpenCodeError
 
 client = OpenCodeClient()  # base_url/directory/timeout default from config
 
-await client.health() -> bool
-await client.create_session(*, title=None, agent=None, permission=None, model=None) -> dict
-await client.send_prompt(session_id, text, *, agent=None, model=None) -> str   # blocking; returns assistant text
+await client.health() -> bool                 # GET /api/info
+await client.create_session(*, title=None, agent=None, permission=None, model=None, directory=None) -> dict
+await client.send_prompt(session_id, text, *, agent=None, model=None) -> str   # prompt + wait; returns assistant text
 await client.prompt_async(session_id, text, *, agent=None) -> None
-await client.abort(session_id) -> None
+await client.abort(session_id) -> None        # session.interrupt (resume=false)
 await client.list_messages(session_id) -> list[dict]
-await client.reply_permission(request_id, reply) -> None   # reply in {"once","always","reject"}
-await client.reply_question(request_id, answers) -> None
-await client.list_models() -> list[dict]        # connected providers: {providerID, modelID, name}
+await client.reply_permission(request_id, reply, *, session_id) -> None   # reply in {"once","always","reject"}
+await client.list_permissions(*, directory=None) -> list[dict]            # GET /api/permission/request
+await client.list_forms(*, directory=None) -> list[dict]                 # GET /api/form
+await client.reply_form(form_id, answer, *, session_id) -> None          # answer: {field_key: value}
+await client.cancel_form(form_id, *, session_id) -> None                 # DELETE form
+await client.list_models() -> list[dict]      # enabled models: {providerID, modelID, name}
 await client.list_sessions(*, directory=None) -> list[dict]
 await client.compact_session(session_id) -> None
+await client.get_session_status() -> dict      # {sessionID: {"type": "busy"}} from session.active
 await client.get_mcp_status(*, directory=None) -> dict        # {server: {"status": ...}}
-await client.list_tool_ids(*, directory=None) -> list[str]
-await client.get_path(*, directory=None) -> dict              # GET /path (server default dirs)
-await client.list_directory(path, *, directory=None) -> list[dict]  # GET /file
+await client.get_path(*, directory=None) -> dict              # GET /api/location
+await client.list_directory(path, *, directory=None) -> list[dict]  # GET /api/fs/list (normalized)
 await client.default_directory(*, directory=None) -> str      # server default, "/" fallback
 
-async for event in client.stream_events():   # parsed SSE events {id, type, properties}
+async for event in client.stream_events():   # parsed SSE events {id, type, data}
     ...
 ```
 
-Endpoints used (all relative to `OPENCODE_BASE_URL`, `directory` as query param):
+Notes: `send_prompt` switches the session model/agent only when they differ from the
+last value it applied (v2 has no per-request model), then `POST /api/session/{id}/prompt`
+and `POST /api/experimental/session/{id}/wait`. `list_messages` concatenates `text`
+parts after the last `user` message. `get_session_todos`/`list_tool_ids` return `[]`
+(v2 has no equivalent).
 
-| Purpose            | Method + path                                    | Body / notes                                        |
-| ------------------ | ------------------------------------------------ | --------------------------------------------------- |
-| Health             | `GET /api/health`                                | -> `{"healthy": true}`                              |
-| Create session     | `POST /session`                                  | `{title, agent, permission?}` -> `Session` (`id`)   |
-| Prompt (blocking)  | `POST /session/{id}/message`                     | `{parts:[{type:"text",text}]}` -> `{info,parts}`    |
-| Prompt (async)     | `POST /session/{id}/prompt_async`                | `204`                                                |
-| Abort              | `POST /session/{id}/abort`                       |                                                      |
-| History            | `GET /session/{id}/message`                      | `[{info,parts}]`                                     |
-| Reply permission   | `POST /permission/{requestID}/reply`             | `{"reply": "once"\|"always"\|"reject"}`             |
-| Events (SSE)       | `GET /event`                                     | `data: {"id","type","properties"}`                   |
-| Server paths       | `GET /path`                                      | `{home, state, config, worktree, directory}`         |
-| List directory     | `GET /file?path=<abs>&directory=<abs>`           | `[{name, path, absolute, type, ignored}]`            |
+Endpoints used (opencode v2, all relative to `OPENCODE_BASE_URL`; the location
+selector is the query param `location[directory]=<abs>`):
 
-The assistant text is the concatenation of `parts` where `type == "text"`.
+| Purpose            | Method + path                                            | Body / notes                                        |
+| ------------------ | -------------------------------------------------------- | --------------------------------------------------- |
+| Health             | `GET /api/info`                                          | -> `{version, pid, urls, paths}`                    |
+| Location           | `GET /api/location?location[directory]=…`                | -> `{directory, project}`                           |
+| Create session     | `POST /api/session`                                      | `{title, agent?, model?, location?}` -> `{data: Session}` |
+| List sessions      | `GET /api/session?directory=…&limit=…`                   | -> `{data: [Session], cursor}`                      |
+| Get session        | `GET /api/session/{id}`                                  | -> `{data: Session}`                                |
+| Active sessions    | `GET /api/session/active`                                | -> `{data: {sessionID: {type}}}`                    |
+| Switch model       | `POST /api/session/{id}/model`                           | `{model: {id, providerID, variant?}}` -> `204`      |
+| Switch agent       | `POST /api/session/{id}/agent`                           | `{agent}` -> `204`                                  |
+| Prompt (async)     | `POST /api/session/{id}/prompt`                          | `{text}` -> `{data: inbox item}`                    |
+| Wait for turn      | `POST /api/experimental/session/{id}/wait`               | `204` when the turn settles                         |
+| Interrupt          | `POST /api/session/{id}/interrupt?resume=false`          | -> `{interrupted}`                                  |
+| History            | `GET /api/session/{id}/message?order=asc&limit=…`        | -> `{data: [Message], cursor}` (assistant `content[]`) |
+| Compact            | `POST /api/session/{id}/compact`                         | `{}` -> `{data: inbox item}`                        |
+| Diff               | `GET /api/session/{id}/diff?from=<msg_>`                 | -> `{data: [FileDiff.Info]}` (snapshot/VCS)         |
+| Reply permission   | `POST /api/session/{id}/permission/{requestID}/reply`    | `{decision: "once"\|"always"\|"reject"}` -> `204`   |
+| List permissions   | `GET /api/permission/request?location[directory]=…`      | -> `{data: [Permission.Request]}`                   |
+| List forms         | `GET /api/form?location[directory]=…`                    | -> `{data: [Form.Info]}`                            |
+| Reply form         | `POST /api/session/{id}/form/{formID}/reply`             | `{answer: {field_key: value}}` -> `204`             |
+| Cancel form        | `DELETE /api/session/{id}/form/{formID}`                 | `204`                                               |
+| Models             | `GET /api/model?location[directory]=…`                   | -> `{data: [Model.Info]}` (enabled only)            |
+| MCP                | `GET /api/mcp?location[directory]=…`                     | -> `{data: [{name, status}]}`                       |
+| List directory     | `GET /api/fs/list?path=<abs>&location[directory]=<abs>`  | -> `{data: [{path, type}]}` (relative names)        |
+| Events (SSE)       | `GET /api/event`                                         | `data: {"id","type","data",...}` (global)           |
+
+The assistant text is the concatenation of `content[]` entries where `type == "text"`.
+
+**v2 event names**: `permission.v2.asked` / `permission.v2.replied`,
+`form.created` / `form.replied` / `form.cancelled` (the agent's `question` tool is
+a form whose `metadata.kind == "question"`), plus `session.text.delta`,
+`session.execution.succeeded`, etc.
 
 ## Phase 3 Flows
 
@@ -447,11 +479,24 @@ The assistant text is the concatenation of `parts` where `type == "text"`.
    voice mode is ON.
 
 **Permission flow**
-1. A background SSE listener (`GET /event`) runs for the bot's lifetime.
-2. On `permission.asked`, the bot maps `sessionID` → user, sends an inline
-   keyboard (Allow once / Always / Reject).
-3. On callback, the bot calls `POST /permission/{requestID}/reply`; the agent
-   loop resumes and the original prompt completes.
+1. A background SSE listener (`GET /api/event`) runs for the bot's lifetime, one
+   per opencode server.
+2. On `permission.v2.asked`, the bot maps `sessionID` → user, records the
+   `sessionID` for the request, and sends an inline keyboard (Allow once /
+   Always / Reject). Pending requests are also reconciled at startup via
+   `GET /api/permission/request`.
+3. On callback, the bot calls
+   `POST /api/session/{sessionID}/permission/{requestID}/reply`; the agent loop
+   resumes and the original prompt completes.
+
+**Question (form) flow**
+1. The agent's `question` tool creates a v2 **form**, emitted as `form.created`
+   (form `metadata.kind == "question"`).
+2. The bot renders each field's options as buttons, collects answers in order,
+   then calls `POST /api/session/{sessionID}/form/{formID}/reply`
+   (`{"answer": {field_key: value}}`); `🚫 Skip` calls `DELETE .../form/{formID}`.
+3. `form.replied`/`form.cancelled` clear the pending state; pending forms are
+   reconciled at startup via `GET /api/form`.
 
 **Concurrency**: serialize prompts per user with an `asyncio.Lock`.
 
@@ -600,8 +645,17 @@ OPENCODE_BASE_URL=http://localhost:4096
 OPENCODE_DIRECTORY=            # empty -> repo root
 OPENCODE_AGENT=build
 OPENCODE_TIMEOUT=600           # seconds for a blocking prompt
+OPENCODE_SERVER_USERNAME=opencode  # HTTP basic auth username (opencode v2)
+OPENCODE_SERVER_PASSWORD=<password>  # HTTP basic auth password (required by v2)
 MEDIA_MAX_MB=20                # max size for inbound/outbound media bridging
 ```
+
+- opencode v2 protects `serve`/`web` with HTTP basic auth when
+  `OPENCODE_SERVER_PASSWORD` is set (username defaults to `opencode`, overridable
+  via `OPENCODE_SERVER_USERNAME`). The launcher passes the password into the
+  spawned `opencode serve` process, and `OpenCodeClient` uses it automatically
+  for the default `OPENCODE_BASE_URL` (localhost included). Custom servers keep
+  their own credentials from the `servers` table.
 
 - `.env.example` contains the same keys with placeholder values.
 - `config.py` resolves relative `DB_PATH`/`MEDIA_DIR` against the repo root and
@@ -690,10 +744,41 @@ python -m venv .venv
    voice mode is OFF.
 4. `/voice on|off` persists per user; `/new` resets the session.
 5. Unauthenticated users are refused with a clear message.
-6. opencode `permission.asked` events produce Telegram inline buttons that,
+6. opencode permission events produce Telegram inline buttons that,
    when tapped, resolve the request and let the prompt finish.
 7. `pytest` passes with no network calls; the bot starts and polls.
 8. No secrets are committed.
+
+## Phase 12 - opencode v2 migration (DONE)
+
+The installed server moved to opencode **v2** (verified live against v2.0.18): the
+HTTP API relocated to `/api/*`, responses are wrapped (`{"data": …}` /
+`{"location": …, "data": …}`), prompts are asynchronous, permissions are
+session-scoped, and the `question` tool is a **form**. `OPENCODE_SERVER_PASSWORD`
+is now required by `serve`/`web` (HTTP basic auth, username defaults to
+`opencode`).
+
+- [x] `config.py`: `OPENCODE_SERVER_USERNAME` (default `opencode`) and
+      `OPENCODE_SERVER_PASSWORD` + `opencode_server_credentials()`.
+- [x] `OpenCodeClient` uses v2 `/api` routes, unwraps envelopes, defaults basic
+      auth from config for `OPENCODE_BASE_URL`; `send_prompt` = switch model/agent
+      (only when changed) → `prompt` → `experimental.wait` → concatenate the
+      newest turn's assistant `content[].text`.
+- [x] Launcher health is `GET /api/info`; the spawned `opencode serve` receives
+      `OPENCODE_SERVER_PASSWORD`/`USERNAME` via `server_env()`.
+- [x] Events: one global `GET /api/event` stream per server; handlers accept
+      `permission.v2.asked` and `form.created`/`form.replied`/`form.cancelled`.
+- [x] Permissions are replied on the session
+      (`/api/session/{id}/permission/{requestID}/reply`) and reconciled at
+      startup via `GET /api/permission/request`.
+- [x] Forms (the `question` tool) are rendered with the existing question UI,
+      answered with `{field_key: value}`, and reconciled via `GET /api/form`.
+- [x] Filesystem browsing uses `GET /api/fs/list` (relative names joined onto the
+      requested path); default dir from `GET /api/location`; models from
+      `GET /api/model`; MCP from `GET /api/mcp`.
+- [x] Outbound media: `file` parts are gone; changed files come from assistant
+      `snapshot.files` (and `GET /api/session/{id}/diff?from=<msg_>`).
+- [x] Tests rewritten for the v2 shapes; no network.
 
 ## Definition of Done (Phase 3.5)
 

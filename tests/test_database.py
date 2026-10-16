@@ -805,3 +805,37 @@ def test_ensure_default_server_has_no_credentials(db_path):
     row = database.ensure_default_server("http://localhost:4096")
     assert row["username"] is None
     assert row["password"] is None
+
+
+def _authed_user(telegram_id, name="User"):
+    user = database.upsert_user(telegram_id, name.lower(), name, "", "en")
+    database.set_authenticated(telegram_id, True)
+    return int(user["id"])
+
+
+def test_get_chat_id_for_directory_matches_and_normalizes(db_path):
+    user_id = _authed_user(501, "Alice")
+    database.set_opencode_session(user_id, "ses_a", "D:/projects/demo", None)
+    assert database.get_chat_id_for_directory("D:/projects/demo") == 501
+    assert database.get_chat_id_for_directory(r"D:\projects\demo") == 501
+    assert database.get_chat_id_for_directory("d:/PROJECTS/DEMO") == 501
+
+
+def test_get_chat_id_for_directory_most_recent_wins(db_path):
+    first = _authed_user(601, "First")
+    second = _authed_user(602, "Second")
+    database.set_opencode_session(first, "ses_1", "D:/shared", None)
+    database.set_opencode_session(second, "ses_2", "D:/shared", None)
+    assert database.get_chat_id_for_directory("D:/shared") == 602
+
+
+def test_get_chat_id_for_directory_ignores_unauthenticated(db_path):
+    user = database.upsert_user(701, "pending", "Pending", "", "en")
+    database.set_opencode_session(int(user["id"]), "ses_p", "D:/pending", None)
+    assert database.get_chat_id_for_directory("D:/pending") is None
+
+
+def test_get_chat_id_for_directory_no_match(db_path):
+    _authed_user(801, "Carol")
+    assert database.get_chat_id_for_directory("D:/nowhere") is None
+    assert database.get_chat_id_for_directory("") is None

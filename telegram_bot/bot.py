@@ -75,13 +75,11 @@ def _row_base_url(row) -> str:
     )
 
 
-async def _listen_events(
-    application: Application, base_url: str, directory: str
-) -> None:
+async def _listen_events(application: Application, base_url: str) -> None:
     client = handlers._client_for_base_url(application, base_url)
     while True:
         try:
-            async for event in client.stream_events(directory=directory):
+            async for event in client.stream_events():
                 await handlers.handle_event(
                     event, bot=application.bot, client=client
                 )
@@ -89,18 +87,16 @@ async def _listen_events(
             raise
         except Exception:
             logger.exception(
-                "opencode event stream error for %s (%s); reconnecting in %ss",
+                "opencode event stream error for %s; reconnecting in %ss",
                 base_url,
-                directory,
                 EVENT_RETRY_DELAY,
             )
         await asyncio.sleep(EVENT_RETRY_DELAY)
 
 
-def desired_event_subscriptions() -> set[tuple[str, str]]:
-    subscriptions = {
-        (_normalize_base_url(config.OPENCODE_BASE_URL), str(config.OPENCODE_DIRECTORY))
-    }
+def desired_event_subscriptions() -> set[str]:
+    """One event stream per server (opencode v2 ``/api/event`` is global)."""
+    subscriptions = {_normalize_base_url(config.OPENCODE_BASE_URL)}
     try:
         rows = database.list_opencode_sessions()
     except Exception:
@@ -109,32 +105,27 @@ def desired_event_subscriptions() -> set[tuple[str, str]]:
     for row in rows:
         if not bool(row["is_authenticated"]):
             continue
-        directory = row["directory"]
-        if directory:
-            subscriptions.add((_row_base_url(row), str(directory)))
+        subscriptions.add(_row_base_url(row))
     return subscriptions
 
 
 def reconcile_event_tasks(
-    application: Application, subscriptions: set[tuple[str, str]]
+    application: Application, subscriptions: set[str]
 ) -> None:
     tasks: dict[str, asyncio.Task] = application.bot_data.setdefault(
         "event_tasks", {}
     )
-    wanted = {
-        f"{base_url}::{directory}": (base_url, directory)
-        for base_url, directory in subscriptions
-    }
+    wanted = {_normalize_base_url(base_url) for base_url in subscriptions}
     for key in list(tasks):
         if key not in wanted:
             task = tasks.pop(key)
             task.cancel()
-    for key, (base_url, directory) in wanted.items():
-        existing = tasks.get(key)
+    for base_url in wanted:
+        existing = tasks.get(base_url)
         if existing is not None and not existing.done():
             continue
-        tasks[key] = application.create_task(
-            _listen_events(application, base_url, directory), name=f"events:{key}"
+        tasks[base_url] = application.create_task(
+            _listen_events(application, base_url), name=f"events:{base_url}"
         )
 
 
@@ -163,6 +154,11 @@ async def post_init(application: Application) -> None:
     database.init_db()
     database.seed_admin(config.ADMIN_USER_ID)
     database.ensure_default_server(config.OPENCODE_BASE_URL)
+    if config.opencode_server_credentials() is None:
+        logger.warning(
+            "OPENCODE_SERVER_PASSWORD is not set; opencode v2 requires it for "
+            "HTTP basic auth on serve/web. Set it in .env."
+        )
     try:
         setup_result = opencode_setup.install_all()
         logger.info("opencode setup install result: %s", setup_result)

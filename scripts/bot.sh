@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+#
+# Manage the opencode-voice launcher (opencode v2 server + Telegram bot).
+#
+#   start  - launch `python -m telegram_bot` in the background; it restarts
+#            opencode serve on the configured port (with OPENCODE_SERVER_PASSWORD
+#            from .env) and then runs the bot. Logs go to logs/.
+#   stop   - stop the launcher and every opencode server listening on the port.
+#   status - report launcher, listener, and /api/info health (with basic auth).
+#
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,27 +130,27 @@ case "$ACTION" in
       listening="yes"
     fi
     healthy="down"
-    if command -v curl >/dev/null 2>&1; then
-      if curl -fsS --max-time 3 "http://127.0.0.1:$PORT/global/health" >/dev/null 2>&1; then
-        healthy="healthy"
-      fi
-    else
-      if "$PY" - "$PORT" <<'PYEOF' >/dev/null 2>&1
-import sys
-import urllib.request
+    if ( cd "$ROOT" && "$PY" - "$PORT" <<'PYEOF'
+import os, sys
 
-port = int(sys.argv[1])
-try:
-    with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/global/health", timeout=3
-    ) as response:
-        sys.exit(0 if 200 <= response.status < 300 else 1)
-except Exception:
-    sys.exit(1)
+sys.path.insert(0, os.getcwd())
+import httpx
+import config
+
+creds = config.opencode_server_credentials()
+auth = httpx.BasicAuth(*creds) if creds else None
+port = sys.argv[1]
+for host in ("localhost", "127.0.0.1"):
+    try:
+        response = httpx.get(f"http://{host}:{port}/api/info", auth=auth, timeout=3)
+        if response.status_code == 200:
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
 PYEOF
-      then
-        healthy="healthy"
-      fi
+    ) >/dev/null 2>&1; then
+      healthy="healthy"
     fi
 
     if [ "$running" = "yes" ]; then

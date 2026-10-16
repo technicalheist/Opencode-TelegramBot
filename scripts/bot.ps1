@@ -1,4 +1,13 @@
 #requires -Version 5.1
+#
+# Manage the opencode-voice launcher (opencode v2 server + Telegram bot).
+#
+#   start  - launch `python -m telegram_bot` hidden; it restarts opencode serve
+#            on the configured port (with OPENCODE_SERVER_PASSWORD from .env)
+#            and then runs the bot. Logs go to logs/.
+#   stop   - stop the launcher and every opencode server listening on the port.
+#   status - report launcher, listener, and /api/info health (with basic auth).
+#
 [CmdletBinding()]
 param(
     [ValidateSet('start', 'stop', 'status')]
@@ -32,6 +41,45 @@ function Get-Port {
     } catch {
     }
     return 4096
+}
+
+function Test-Health([int]$Port) {
+    $py = Get-Python
+    $script = Join-Path ([System.IO.Path]::GetTempPath()) "ocv_health_$PID.py"
+    $code = @'
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
+import httpx
+import config
+
+creds = config.opencode_server_credentials()
+auth = httpx.BasicAuth(*creds) if creds else None
+port = sys.argv[1]
+for host in ("localhost", "127.0.0.1"):
+    try:
+        response = httpx.get(f"http://{host}:{port}/api/info", auth=auth, timeout=3)
+        if response.status_code == 200:
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+'@
+    try {
+        Set-Content -LiteralPath $script -Value $code -Encoding utf8
+        Push-Location -LiteralPath $Root
+        try {
+            & $py $script "$Port" 2>$null | Out-Null
+            return ($LASTEXITCODE -eq 0)
+        } finally {
+            Pop-Location
+        }
+    } catch {
+        return $false
+    } finally {
+        Remove-Item -LiteralPath $script -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Get-RunningPid {
@@ -109,13 +157,7 @@ if ($Action -eq 'stop') {
 $port = Get-Port
 $running = Get-RunningPid
 $listening = (Get-ListenerPids $port).Count -gt 0
-$healthy = $false
-try {
-    $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$port/global/health" -TimeoutSec 3
-    $healthy = $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
-} catch {
-    $healthy = $false
-}
+$healthy = Test-Health $port
 
 if ($running) { Write-Host "launcher: running (pid $running)" } else { Write-Host "launcher: not running" }
 if ($listening) { Write-Host "opencode server: listening on port $port" } else { Write-Host "opencode server: not listening on port $port" }

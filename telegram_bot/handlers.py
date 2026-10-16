@@ -217,6 +217,7 @@ ACTIVE_TASKS: dict[int, dict] = {}
 PENDING_QUESTIONS: dict[int, dict] = {}
 PENDING_SERVER_INPUT: dict[int, dict] = {}
 PERMISSION_SERVERS: dict[str, str] = {}
+PERMISSION_SESSIONS: dict[str, str] = {}
 
 QUESTION_EXPIRED_TEXT = "This question expired. Please wait for a new prompt."
 QUESTION_SKIPPED_TEXT = "🚫 Question skipped."
@@ -281,9 +282,13 @@ def format_activity(part: Optional[dict]) -> Optional[str]:
         return None
     part_type = str(part.get("type") or "")
     if part_type == "tool":
-        tool = str(part.get("tool") or "?")
+        tool = str(part.get("name") or part.get("tool") or "?")
         state = part.get("state")
-        status = state.get("status") if isinstance(state, dict) else None
+        status = None
+        if isinstance(state, dict):
+            status = state.get("status") or state.get("type") or state.get("_tag")
+        elif isinstance(state, str):
+            status = state
         return f"tool:{tool} ({status})" if status else f"tool:{tool}"
     if part_type == "reasoning":
         return "reasoning"
@@ -335,6 +340,26 @@ def parse_permission_callback(data: str) -> Optional[tuple[str, str]]:
     if reply not in VALID_PERMISSION_REPLIES or not request_id:
         return None
     return reply, request_id
+
+
+async def present_permission(
+    bot, row, request: PermissionRequest, *, base_url: str
+) -> None:
+    if not request.id or not request.session_id:
+        return
+    PERMISSION_SERVERS[request.id] = base_url
+    PERMISSION_SESSIONS[request.id] = request.session_id
+    text = f"opencode needs permission: {request.action or 'action'}"
+    if request.resources:
+        text += "\n\n" + "\n".join(f"• {resource}" for resource in request.resources)
+    try:
+        await bot.send_message(
+            chat_id=int(row["telegram_id"]),
+            text=text,
+            reply_markup=build_permission_keyboard(request),
+        )
+    except Exception:
+        logger.exception("Failed to surface permission request %s", request.id)
 
 
 def build_voice_keyboard(enabled: bool) -> InlineKeyboardMarkup:
@@ -1274,7 +1299,12 @@ def _session_media_file(path: str, base: Path) -> Optional[Path]:
 
 
 async def _fetch_media_bytes(
-    url: str, *, max_bytes: int, directory: Optional[Path] = None
+    url: str,
+    *,
+    max_bytes: int,
+    directory: Optional[Path] = None,
+    auth=None,
+    headers: Optional[dict] = None,
 ) -> tuple[bytes, Optional[str]]:
     raw = str(url or "")
     if raw.startswith("data:"):
@@ -1319,7 +1349,9 @@ async def _fetch_media_bytes(
         return data, None
     if raw.startswith("http://") or raw.startswith("https://"):
         content_type: Optional[str] = None
-        async with httpx.AsyncClient(timeout=HTTP_MEDIA_TIMEOUT) as client:
+        async with httpx.AsyncClient(
+            timeout=HTTP_MEDIA_TIMEOUT, auth=auth, headers=headers
+        ) as client:
             async with client.stream("GET", raw) as response:
                 if response.status_code >= 400:
                     raise ValueError(f"HTTP {response.status_code} fetching media")
@@ -1368,8 +1400,24 @@ async def _send_media_bytes(
         await message.reply_document(buffer, filename=filename)
 
 
+def _media_url_auth(client, url: str):
+    """Return ``(auth, headers)`` for a media URL hosted by ``client``'s server.
+
+    Credentials are only attached when the URL shares the client's origin, so
+    the server's basic-auth secret is never leaked to third-party hosts.
+    """
+    try:
+        target = urllib.parse.urlparse(str(url or ""))
+        base = urllib.parse.urlparse(str(getattr(client, "base_url", "") or ""))
+    except ValueError:
+        return None, None
+    if not target.netloc or not base.netloc or target.netloc != base.netloc:
+        return None, None
+    return getattr(client, "auth", None), getattr(client, "auth_headers", None)
+
+
 async def _send_outbound_media(
-    message, *, session_id: str, directory, parts, diff_files
+    message, *, session_id: str, directory, parts, diff_files, client=None
 ) -> None:
     try:
         max_bytes = max(0, int(config.MEDIA_MAX_MB)) * 1024 * 1024
@@ -1397,6 +1445,17 @@ async def _send_outbound_media(
                 path = _entry_path(entry)
                 if path:
                     candidates.append({"kind": "path", "path": path})
+    # opencode v2 assistant messages expose changed files via ``snapshot.files``.
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+        snapshot = part.get("snapshot")
+        if not isinstance(snapshot, dict):
+            continue
+        for entry in snapshot.get("files") or []:
+            path = _entry_path(entry)
+            if path:
+                candidates.append({"kind": "path", "path": path})
     for entry in diff_files or []:
         path = _entry_path(entry)
         if path:
@@ -1422,8 +1481,13 @@ async def _send_outbound_media(
                 key = "url:" + hashlib.sha1(
                     candidate["url"].encode("utf-8")
                 ).hexdigest()
+                auth, headers = _media_url_auth(client, candidate["url"])
                 data, fetched_mime = await _fetch_media_bytes(
-                    candidate["url"], max_bytes=max_bytes, directory=base
+                    candidate["url"],
+                    max_bytes=max_bytes,
+                    directory=base,
+                    auth=auth,
+                    headers=headers,
                 )
                 mime = mime or fetched_mime
                 filename = Path(str(filename)).name or "media"
@@ -1516,6 +1580,7 @@ async def _process_prompt(
                 directory=directory,
                 parts=parts,
                 diff_files=diff_files,
+                client=client,
             )
         except Exception:
             logger.exception(
@@ -2396,6 +2461,62 @@ async def _show_current_question(bot, telegram_id: int, *, edit: bool = False) -
         logger.exception("Could not send question message")
 
 
+def _form_to_question_request(form: dict) -> Optional[dict]:
+    """Map a v2 form created by the ``question`` tool to the question UI shape."""
+    if not isinstance(form, dict):
+        return None
+    metadata = form.get("metadata") if isinstance(form.get("metadata"), dict) else {}
+    kind = metadata.get("kind")
+    if kind and kind != "question":
+        return None
+    questions: list[dict] = []
+    for index, field in enumerate(form.get("fields") or []):
+        if not isinstance(field, dict):
+            continue
+        options = []
+        for option in field.get("options") or []:
+            if isinstance(option, dict):
+                options.append(
+                    {
+                        "label": str(option.get("label") or option.get("value") or ""),
+                        "description": str(option.get("description") or ""),
+                    }
+                )
+        field_type = str(field.get("type") or "string")
+        questions.append(
+            {
+                "key": str(field.get("key") or f"q{index}"),
+                "type": field_type,
+                "header": str(field.get("title") or ""),
+                "question": str(field.get("description") or field.get("title") or ""),
+                "options": options,
+                "multiple": field_type == "multiselect",
+                "custom": bool(field.get("custom", True)),
+            }
+        )
+    if not questions:
+        return None
+    return {
+        "id": str(form.get("id") or ""),
+        "sessionID": str(form.get("sessionID") or ""),
+        "questions": questions,
+    }
+
+
+def _form_answer(state: dict) -> dict:
+    answer: dict = {}
+    questions = state.get("questions") or []
+    answers = state.get("answers") or []
+    for index, question in enumerate(questions):
+        key = str(question.get("key") or f"q{index}")
+        values = list(answers[index] if index < len(answers) else [])
+        if question.get("multiple") or question.get("type") == "multiselect":
+            answer[key] = values
+        else:
+            answer[key] = values[0] if values else ""
+    return answer
+
+
 async def present_question(
     bot, user_row, request, *, directory=None, base_url=None
 ) -> None:
@@ -2442,14 +2563,12 @@ async def _record_answer(
     client = _client_for_base_url(
         context, state.get("base_url") or config.OPENCODE_BASE_URL
     )
-    directory = state.get("directory") or None
     try:
-        if directory:
-            await client.reply_question(
-                state["request_id"], state["answers"], directory=directory
-            )
-        else:
-            await client.reply_question(state["request_id"], state["answers"])
+        await client.reply_form(
+            str(state["request_id"]),
+            _form_answer(state),
+            session_id=str(state.get("session_id") or ""),
+        )
     except Exception:
         logger.exception("Failed to reply to question %s", state.get("request_id"))
         PENDING_QUESTIONS.pop(telegram_id, None)
@@ -2486,14 +2605,11 @@ async def question_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         client = _client_for_base_url(
             context, state.get("base_url") or config.OPENCODE_BASE_URL
         )
-        directory = state.get("directory") or None
         try:
-            if directory:
-                await client.reject_question(
-                    state["request_id"], directory=directory
-                )
-            else:
-                await client.reject_question(state["request_id"])
+            await client.cancel_form(
+                str(state["request_id"]),
+                session_id=str(state.get("session_id") or ""),
+            )
         except Exception:
             logger.exception("Failed to reject question %s", state.get("request_id"))
             await query.answer(QUESTION_SKIP_ERROR_TEXT, show_alert=True)
@@ -2586,14 +2702,15 @@ async def reconcile_questions(application) -> None:
         directories = {str(row["directory"]) for row in rows if row["directory"]}
         for directory in directories:
             try:
-                questions = await client.list_questions(directory=directory)
+                forms = await client.list_forms(directory=directory)
             except Exception:
                 logger.exception(
                     "Could not list questions for %s (%s)", base, directory
                 )
                 continue
-            for request in questions or []:
-                if not isinstance(request, dict):
+            for form in forms or []:
+                request = _form_to_question_request(form)
+                if request is None:
                     continue
                 session_id = str(request.get("sessionID") or "")
                 if session_id not in session_ids:
@@ -2614,6 +2731,35 @@ async def reconcile_questions(application) -> None:
                 except Exception:
                     logger.exception(
                         "Could not present pending question %s", request.get("id")
+                    )
+            try:
+                permissions = await client.list_permissions(directory=directory)
+            except Exception:
+                logger.exception(
+                    "Could not list permissions for %s (%s)", base, directory
+                )
+                permissions = []
+            for item in permissions or []:
+                request = PermissionRequest.from_event({"data": item})
+                if not request.id or request.session_id not in session_ids:
+                    continue
+                target = next(
+                    (
+                        r
+                        for r in rows
+                        if str(r["session_id"]) == request.session_id
+                    ),
+                    None,
+                )
+                if target is None:
+                    continue
+                try:
+                    await present_permission(
+                        application.bot, target, request, base_url=base
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not present pending permission %s", request.id
                     )
 
 
@@ -2651,13 +2797,18 @@ async def permission_callback(
     client = _client_for_base_url(
         context, PERMISSION_SERVERS.get(request_id) or config.OPENCODE_BASE_URL
     )
+    session_id = PERMISSION_SESSIONS.get(request_id)
+    if not session_id:
+        await query.answer("This permission request expired.", show_alert=True)
+        return
     try:
-        await client.reply_permission(request_id, reply)
+        await client.reply_permission(request_id, reply, session_id=session_id)
     except Exception:
         logger.exception("Failed to reply to permission %s", request_id)
         await query.answer("Could not send that decision.", show_alert=True)
         return
     PERMISSION_SERVERS.pop(request_id, None)
+    PERMISSION_SESSIONS.pop(request_id, None)
     await query.answer()
     original = getattr(getattr(query, "message", None), "text", None) or "Permission request"
     try:
@@ -3145,37 +3296,32 @@ async def handle_event(event: dict, *, bot, client) -> None:
     if not isinstance(event, dict):
         return
     event_type = event.get("type")
-    if event_type == "permission.asked":
+    base_url = _normalize_base_url(getattr(client, "base_url", ""))
+    if event_type in {"permission.v2.asked", "permission.asked"}:
         request = PermissionRequest.from_event(event)
         if not request.id or not request.session_id:
-            logger.warning("Ignoring malformed permission.asked event: %s", event)
+            logger.warning("Ignoring malformed permission event: %s", event)
             return
-        PERMISSION_SERVERS[request.id] = _normalize_base_url(
-            getattr(client, "base_url", "")
-        )
         row = database.get_user_by_session_id(request.session_id)
         if row is None:
             logger.info("Permission request for unknown session %s", request.session_id)
             return
-        text = f"opencode needs permission: {request.permission}"
-        if request.patterns:
-            text += "\n\n" + "\n".join(f"• {pattern}" for pattern in request.patterns)
-        try:
-            await bot.send_message(
-                chat_id=int(row["telegram_id"]),
-                text=text,
-                reply_markup=build_permission_keyboard(request),
-            )
-        except Exception:
-            logger.exception("Failed to surface permission request %s", request.id)
+        await present_permission(bot, row, request, base_url=base_url)
         return
-    if event_type == "question.asked":
-        properties = event.get("properties") or {}
-        request_id = str(properties.get("id") or "")
-        session_id = str(properties.get("sessionID") or "")
-        if not request_id or not session_id:
-            logger.warning("Ignoring malformed question.asked event: %s", event)
+    if event_type in {"form.created", "question.v2.asked", "question.asked"}:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        form = data.get("form") if isinstance(data.get("form"), dict) else None
+        if form is not None:
+            request = _form_to_question_request(form)
+        else:
+            request = {
+                "id": str(data.get("id") or ""),
+                "sessionID": str(data.get("sessionID") or ""),
+                "questions": list(data.get("questions") or []),
+            }
+        if request is None or not request.get("id") or not request.get("sessionID"):
             return
+        session_id = str(request["sessionID"])
         row = database.get_user_by_session_id(session_id)
         if row is None:
             logger.info("Question request for unknown session %s", session_id)
@@ -3185,18 +3331,22 @@ async def handle_event(event: dict, *, bot, client) -> None:
         if session is not None:
             directory = session["directory"]
         await present_question(
-            bot,
-            row,
-            properties,
-            directory=directory,
-            base_url=_normalize_base_url(getattr(client, "base_url", "")),
+            bot, row, request, directory=directory, base_url=base_url
         )
         return
-    if event_type in {"question.replied", "question.rejected"}:
-        properties = event.get("properties") or {}
+    if event_type in {
+        "form.replied",
+        "form.cancelled",
+        "question.v2.replied",
+        "question.v2.rejected",
+        "question.replied",
+        "question.rejected",
+    }:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        form = data.get("form") if isinstance(data.get("form"), dict) else {}
         _clear_question_state(
-            str(properties.get("sessionID") or ""),
-            str(properties.get("requestID") or ""),
+            str(data.get("sessionID") or form.get("sessionID") or ""),
+            str(data.get("formID") or data.get("requestID") or form.get("id") or ""),
         )
         return
     return

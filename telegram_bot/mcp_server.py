@@ -10,22 +10,20 @@ if str(_ROOT) not in sys.path:
 import asyncio
 import json
 import logging
+import os
 from typing import Optional
 
+from telegram_bot import database
 from telegram_bot.send_media import SendMediaError, send_file
 
 logger = logging.getLogger(__name__)
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except Exception:
-    FastMCP = None
-
 _TOOL_SPEC = {
     "name": "telegram_send_file",
     "description": (
-        "Send a local file or image to the Telegram user via the bot. "
-        "Use this to deliver screenshots, images, documents, or any file."
+        "Send a local file or image to the Telegram user who is chatting with "
+        "the bot in this session. Use this to deliver screenshots, images, "
+        "documents, or any file."
     ),
     "inputSchema": {
         "type": "object",
@@ -44,9 +42,19 @@ _TOOL_SPEC = {
 }
 
 
-async def telegram_send_file(path: str, caption: Optional[str] = None) -> str:
+def resolve_chat_id(session_id: Optional[str]) -> Optional[int]:
+    if session_id:
+        row = database.get_user_by_session_id(session_id)
+        if row is not None:
+            return int(row["telegram_id"])
+    return database.get_chat_id_for_directory(os.getcwd())
+
+
+async def telegram_send_file(
+    path: str, caption: Optional[str] = None, chat_id: Optional[int] = None
+) -> str:
     try:
-        await send_file(path, caption=caption, chat_id=None)
+        await send_file(path, caption=caption, chat_id=chat_id)
     except SendMediaError as exc:
         return f"Error: {exc}"
     except Exception as exc:
@@ -104,7 +112,11 @@ def _handle_request(request: dict) -> Optional[dict]:
                 "id": request_id,
                 "result": _tool_result("Error: path is required"),
             }
-        text = asyncio.run(telegram_send_file(path, arguments.get("caption")))
+        meta = params.get("_meta") or {}
+        chat_id = resolve_chat_id(meta.get("sessionID"))
+        text = asyncio.run(
+            telegram_send_file(path, arguments.get("caption"), chat_id=chat_id)
+        )
         return {"jsonrpc": "2.0", "id": request_id, "result": _tool_result(text)}
     if request_id is None:
         return None
@@ -134,17 +146,8 @@ def _run_fallback() -> None:
         sys.stdout.flush()
 
 
-def _build_fastmcp():
-    server = FastMCP("opencode-voice-telegram")
-    server.tool(name="telegram_send_file")(telegram_send_file)
-    return server
-
-
 def run() -> None:
-    if FastMCP is not None:
-        _build_fastmcp().run()
-    else:
-        _run_fallback()
+    _run_fallback()
 
 
 if __name__ == "__main__":

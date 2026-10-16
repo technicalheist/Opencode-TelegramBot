@@ -12,11 +12,18 @@ from telegram_bot import launcher
 def _fake_get(handler):
     real_client = httpx.Client
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, timeout=None, auth=None):
         with real_client(transport=httpx.MockTransport(handler)) as client:
-            return client.get(url)
+            return client.get(url, auth=auth)
 
     return fake_get
+
+
+def _basic_header(username: str, password: str) -> str:
+    import base64
+
+    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
 
 
 def test_parse_base_url_variants():
@@ -42,26 +49,86 @@ def test_is_healthy_false(monkeypatch):
     assert launcher.is_healthy("http://x") is False
 
 
+def test_is_healthy_accepts_v2_info(monkeypatch):
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"version": "2.0.18", "pid": 42})
+
+    monkeypatch.setattr(launcher.httpx, "get", _fake_get(handler))
+    assert launcher.is_healthy("http://x") is True
+    assert seen == ["/api/info"]
+
+
 def test_is_healthy_falls_back_to_api_health(monkeypatch):
     calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request.url.path)
-        if request.url.path == "/global/health":
+        if request.url.path == "/api/info":
             return httpx.Response(404, text="missing")
         return httpx.Response(200, json={"healthy": True})
 
     monkeypatch.setattr(launcher.httpx, "get", _fake_get(handler))
     assert launcher.is_healthy("http://x") is True
-    assert calls == ["/global/health", "/api/health"]
+    assert calls == ["/api/info", "/api/health"]
 
 
 def test_is_healthy_swallows_errors(monkeypatch):
-    def boom(url, timeout=None):
+    def boom(url, timeout=None, auth=None):
         raise httpx.ConnectError("nope")
 
     monkeypatch.setattr(launcher.httpx, "get", boom)
     assert launcher.is_healthy("http://x") is False
+
+
+def test_is_healthy_sends_config_basic_auth(monkeypatch):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    monkeypatch.setattr(launcher.httpx, "get", _fake_get(handler))
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_USERNAME", "opencode")
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "s3cret")
+
+    assert launcher.is_healthy("http://x") is True
+    assert seen["authorization"] == _basic_header("opencode", "s3cret")
+
+
+def test_is_healthy_no_auth_without_password(monkeypatch):
+    seen: dict = {"authorization": "unset"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"healthy": True})
+
+    monkeypatch.setattr(launcher.httpx, "get", _fake_get(handler))
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "")
+
+    assert launcher.is_healthy("http://x") is True
+    assert seen["authorization"] is None
+
+
+def test_server_env_includes_credentials(monkeypatch):
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_USERNAME", "opencode")
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "s3cret")
+
+    env = launcher.server_env()
+
+    assert env["OPENCODE_SERVER_PASSWORD"] == "s3cret"
+    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
+
+
+def test_server_env_omits_credentials_without_password(monkeypatch):
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "")
+
+    env = launcher.server_env()
+
+    assert "OPENCODE_SERVER_PASSWORD" not in env
 
 
 def test_build_serve_command_plain_executable(monkeypatch):
@@ -166,7 +233,7 @@ def test_kill_pid_os_posix_uses_process_group(monkeypatch):
 
 
 def test_stop_existing_server_no_pid(monkeypatch):
-    monkeypatch.setattr(launcher, "find_listening_pid", lambda port: None)
+    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [])
     killed: list[int] = []
     monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
 
@@ -175,7 +242,7 @@ def test_stop_existing_server_no_pid(monkeypatch):
 
 
 def test_stop_existing_server_terminates_tree(monkeypatch):
-    monkeypatch.setattr(launcher, "find_listening_pid", lambda port: 1234)
+    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [1234])
     killed: list[int] = []
     monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
     monkeypatch.setattr(
@@ -184,6 +251,18 @@ def test_stop_existing_server_terminates_tree(monkeypatch):
 
     assert launcher.stop_existing_server("http://x", 4096) is True
     assert killed == [1234]
+
+
+def test_stop_existing_server_kills_all_listeners(monkeypatch):
+    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [11128, 12184])
+    killed: list[int] = []
+    monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(
+        launcher, "_wait_for_port_free", lambda port, timeout=10.0: True
+    )
+
+    assert launcher.stop_existing_server("http://x", 4096) is True
+    assert killed == [11128, 12184]
 
 
 def test_terminate_pid_tree_uses_psutil(monkeypatch):
@@ -256,6 +335,20 @@ def test_main_runs_in_order_and_cleans_up(monkeypatch):
 
     assert launcher.main() == 0
     assert calls == ["install", "stop", "start", "wait", "bot", "terminate"]
+
+
+def test_main_binds_server_to_all_interfaces(monkeypatch):
+    calls: list[str] = []
+    _main_env(monkeypatch, calls)
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        launcher,
+        "build_serve_command",
+        lambda host, port: seen.append((host, port)) or ["opencode", "serve"],
+    )
+
+    assert launcher.main() == 0
+    assert seen == [("0.0.0.0", 4096)]
 
 
 def test_main_terminates_when_bot_raises(monkeypatch):

@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import pytest
+from dotenv import dotenv_values
 
 import config
+
+
+def test_env_file_overrides_exported_environment(monkeypatch):
+    # ``config`` loads the root .env with override=True so a stale exported
+    # variable cannot shadow the file (which caused 401s against opencode).
+    import importlib
+
+    file_value = dotenv_values(config.ENV_FILE).get("OPENCODE_SERVER_PASSWORD")
+    if not file_value:
+        pytest.skip("no OPENCODE_SERVER_PASSWORD in .env")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "definitely-not-the-file-value")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.OPENCODE_SERVER_PASSWORD == file_value.strip()
+    finally:
+        importlib.reload(config)
 
 
 def test_admin_user_id_required(monkeypatch):
@@ -62,6 +79,23 @@ def test_webhook_port_rejects_invalid(monkeypatch):
     monkeypatch.setenv("TELEGRAM_WEBHOOK_PORT", "0")
     with pytest.raises(RuntimeError):
         config._parse_webhook_port()
+
+
+def test_opencode_server_credentials_none_without_password(monkeypatch):
+    monkeypatch.setattr(config, "OPENCODE_SERVER_PASSWORD", "")
+    assert config.opencode_server_credentials() is None
+
+
+def test_opencode_server_credentials_defaults_username(monkeypatch):
+    monkeypatch.setattr(config, "OPENCODE_SERVER_PASSWORD", "pw")
+    monkeypatch.setattr(config, "OPENCODE_SERVER_USERNAME", "")
+    assert config.opencode_server_credentials() == ("opencode", "pw")
+
+
+def test_opencode_server_credentials_uses_configured_username(monkeypatch):
+    monkeypatch.setattr(config, "OPENCODE_SERVER_PASSWORD", "pw")
+    monkeypatch.setattr(config, "OPENCODE_SERVER_USERNAME", "alice")
+    assert config.opencode_server_credentials() == ("alice", "pw")
 
 
 def test_media_max_mb_default(monkeypatch):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -625,6 +626,32 @@ def get_user_by_session_id(session_id: str) -> Optional[sqlite3.Row]:
             """,
             (session_id,),
         ).fetchone()
+
+
+def _normalize_directory(path: str) -> str:
+    return os.path.normcase(os.path.normpath(str(path))).rstrip("\\/")
+
+
+def get_chat_id_for_directory(directory: str) -> Optional[int]:
+    target = _normalize_directory(directory)
+    if not target:
+        return None
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                opencode_sessions.directory AS directory,
+                users.telegram_id AS telegram_id
+            FROM opencode_sessions
+            JOIN users ON users.id = opencode_sessions.user_id
+            WHERE users.is_authenticated = 1
+            ORDER BY opencode_sessions.updated_at DESC
+            """
+        ).fetchall()
+    for row in rows:
+        if _normalize_directory(str(row["directory"])) == target:
+            return int(row["telegram_id"])
+    return None
 
 
 def insert_media(

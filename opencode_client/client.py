@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 VALID_PERMISSION_REPLIES = {"once", "always", "reject"}
 
+MESSAGE_LIST_LIMIT = 200
+
 
 class OpenCodeError(RuntimeError):
     pass
@@ -22,23 +24,29 @@ class OpenCodeError(RuntimeError):
 
 @dataclass
 class PermissionRequest:
+    """A pending opencode permission request (v2 ``permission.v2.asked``)."""
+
     id: str
     session_id: str
-    permission: str
-    patterns: list[str] = field(default_factory=list)
+    action: str = ""
+    resources: list[str] = field(default_factory=list)
+    save: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
-    always: list[str] = field(default_factory=list)
+    source: dict = field(default_factory=dict)
 
     @classmethod
     def from_event(cls, event: dict) -> "PermissionRequest":
-        properties = event.get("properties") or {}
+        properties = event.get("data") or event.get("properties") or {}
+        if not isinstance(properties, dict):
+            properties = {}
         return cls(
             id=str(properties.get("id", "")),
             session_id=str(properties.get("sessionID", "")),
-            permission=str(properties.get("permission", "")),
-            patterns=list(properties.get("patterns") or []),
+            action=str(properties.get("action", "")),
+            resources=[str(item) for item in (properties.get("resources") or [])],
+            save=[str(item) for item in (properties.get("save") or [])],
             metadata=dict(properties.get("metadata") or {}),
-            always=list(properties.get("always") or []),
+            source=dict(properties.get("source") or {}),
         )
 
 
@@ -98,15 +106,68 @@ def _normalize_model(model: dict | None) -> tuple[str, str] | None:
     return str(provider_id), str(model_id)
 
 
-def _session_model_payload(model: dict | None) -> dict | None:
-    normalized = _normalize_model(model)
-    if normalized is None:
+def _model_ref(model: dict | None) -> dict | None:
+    """Translate a model payload to the v2 ``Model.Ref`` shape."""
+    if not isinstance(model, dict):
         return None
-    provider_id, model_id = normalized
-    payload: dict = {"id": model_id, "providerID": provider_id}
-    if isinstance(model, dict) and model.get("variant") is not None:
-        payload["variant"] = model["variant"]
-    return payload
+    model_id = model.get("id") or model.get("modelID") or model.get("modelId")
+    provider_id = model.get("providerID") or model.get("providerId")
+    if not model_id or not provider_id:
+        return None
+    ref: dict = {"id": str(model_id), "providerID": str(provider_id)}
+    if model.get("variant") is not None:
+        ref["variant"] = model["variant"]
+    return ref
+
+
+def _model_key(ref: dict | None) -> str | None:
+    if not isinstance(ref, dict):
+        return None
+    return f"{ref.get('providerID', '')}/{ref.get('id', '')}"
+
+
+def _created(message: dict) -> float:
+    time = message.get("time") if isinstance(message, dict) else None
+    if isinstance(time, dict):
+        value = time.get("created")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _assistant_text(message: dict) -> list[str]:
+    if not isinstance(message, dict) or message.get("type") != "assistant":
+        return []
+    chunks: list[str] = []
+    for part in message.get("content") or []:
+        if (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        ):
+            chunks.append(part["text"])
+    return chunks
+
+
+def _assistant_parts(message: dict) -> list[dict]:
+    if not isinstance(message, dict) or message.get("type") != "assistant":
+        return []
+    return [part for part in (message.get("content") or []) if isinstance(part, dict)]
+
+
+def _mcp_status_label(status) -> str:
+    if isinstance(status, str):
+        return status
+    if isinstance(status, dict):
+        for key in ("type", "status", "state", "_tag"):
+            value = status.get(key)
+            if isinstance(value, str) and value:
+                return value
+        if len(status) == 1:
+            key = next(iter(status))
+            if isinstance(key, str):
+                return key
+    return "unknown"
 
 
 class OpenCodeClient:
@@ -135,6 +196,18 @@ class OpenCodeClient:
         # ``password`` and ``token`` are aliases for the secret; ``token`` is only
         # consulted when ``password`` is None. Credentials are never logged.
         secret = password if password is not None else token
+        if username is None and not secret:
+            # opencode v2 requires HTTP basic auth when OPENCODE_SERVER_PASSWORD
+            # is set. Fall back to the configured credentials for the default
+            # server (including localhost) so callers do not have to pass them.
+            default_url = config.OPENCODE_BASE_URL.rstrip("/")
+            credentials = (
+                config.opencode_server_credentials()
+                if self._base_url == default_url
+                else None
+            )
+            if credentials is not None:
+                username, secret = credentials
         self._auth = httpx.BasicAuth(username, secret or "") if username else None
         self._headers = (
             {"Authorization": f"Bearer {secret}"}
@@ -142,6 +215,7 @@ class OpenCodeClient:
             else None
         )
         self._client = client
+        self._session_selection: dict[str, dict] = {}
 
     @property
     def base_url(self) -> str:
@@ -155,6 +229,16 @@ class OpenCodeClient:
     def timeout(self) -> float:
         return self._timeout
 
+    @property
+    def auth(self) -> httpx.Auth | None:
+        """Auth object for httpx, or ``None`` when the client is unauthenticated."""
+        return self._auth
+
+    @property
+    def auth_headers(self) -> dict | None:
+        """Extra headers (e.g. ``Authorization: Bearer``) or ``None``."""
+        return self._headers
+
     @asynccontextmanager
     async def _http(self) -> AsyncIterator[httpx.AsyncClient]:
         if self._client is not None:
@@ -165,12 +249,14 @@ class OpenCodeClient:
             ) as client:
                 yield client
 
+    def _location_params(self, directory: str | Path | None = None) -> dict[str, str]:
+        target = directory if directory is not None else self._directory
+        if target is None:
+            return {}
+        return {"location[directory]": str(target)}
+
     def _params(self, directory: str | Path | None = None) -> dict[str, str]:
-        if directory is None:
-            if self._directory is None:
-                return {}
-            return {"directory": str(self._directory)}
-        return {"directory": str(directory)}
+        return self._location_params(directory)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
@@ -178,7 +264,9 @@ class OpenCodeClient:
     def _raise_for_status(
         self, method: str, path: str, response: httpx.Response
     ) -> None:
-        logger.warning("%s %s failed with status %s", method, path, response.status_code)
+        logger.warning(
+            "%s %s failed with status %s", method, path, response.status_code
+        )
         snippet = response.text[:500]
         raise OpenCodeError(
             f"{method} {path} failed with status {response.status_code}: {snippet}"
@@ -188,12 +276,16 @@ class OpenCodeClient:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
 
+    @staticmethod
+    def _data(body: dict, default=None):
+        if isinstance(body, dict) and "data" in body:
+            return body["data"]
+        return default if default is not None else body
+
     async def health(self) -> bool:
-        path = "/api/health"
+        path = "/api/info"
         async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(), timeout=self._timeout
-            )
+            response = await client.get(self._url(path), timeout=self._timeout)
         if response.status_code >= 400:
             logger.warning("GET %s failed with status %s", path, response.status_code)
             return False
@@ -201,7 +293,9 @@ class OpenCodeClient:
             body = response.json()
         except ValueError:
             return False
-        return isinstance(body, dict) and body.get("healthy") is True
+        return isinstance(body, dict)
+
+    # -- sessions --------------------------------------------------------
 
     async def create_session(
         self,
@@ -212,26 +306,23 @@ class OpenCodeClient:
         model: dict | None = None,
         directory: str | Path | None = None,
     ) -> dict:
-        path = "/session"
+        path = "/api/session"
         payload: dict = {}
         if title is not None:
             payload["title"] = title
         if agent is not None:
             payload["agent"] = agent
         if permission is not None:
-            payload["permission"] = permission
-        if model is not None:
-            translated = _session_model_payload(model)
-            if translated is None:
-                raise OpenCodeError("Invalid model payload for session creation.")
-            payload["model"] = translated
+            payload["permissions"] = permission
+        ref = _model_ref(model)
+        if ref is not None:
+            payload["model"] = ref
+        if directory is not None:
+            payload["location"] = {"directory": str(directory)}
 
         async with self._http() as client:
             response = await client.post(
-                self._url(path),
-                params=self._params(directory),
-                json=payload,
-                timeout=self._timeout,
+                self._url(path), json=payload, timeout=self._timeout
             )
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
@@ -239,9 +330,129 @@ class OpenCodeClient:
             body = response.json()
         except ValueError as exc:
             raise OpenCodeError("Session response was not valid JSON.") from exc
-        if not isinstance(body, dict):
+        session = self._data(body)
+        if not isinstance(session, dict):
+            raise OpenCodeError("Session response did not contain a session.")
+        session_id = str(session.get("id") or "")
+        if session_id:
+            selection: dict = {}
+            if agent:
+                selection["agent"] = agent
+            if ref:
+                selection["model"] = _model_key(ref)
+            self._session_selection[session_id] = selection
+        return session
+
+    async def list_sessions(
+        self, *, directory: str | Path | None = None, limit: int = 50
+    ) -> list[dict]:
+        path = "/api/session"
+        params: dict[str, str] = {"limit": str(limit)}
+        target = directory if directory is not None else self._directory
+        if target is not None:
+            params["directory"] = str(target)
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path), params=params, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Session list response was not valid JSON.") from exc
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("Session list response was not a JSON array.")
+        return data
+
+    async def get_session(self, session_id: str) -> dict:
+        path = f"/api/session/{session_id}"
+        async with self._http() as client:
+            response = await client.get(self._url(path), timeout=self._timeout)
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Session response was not valid JSON.") from exc
+        session = self._data(body)
+        if not isinstance(session, dict):
             raise OpenCodeError("Session response was not a JSON object.")
-        return body
+        return session
+
+    async def get_session_status(self) -> dict:
+        """Return ``{sessionID: {"type": "busy"}}`` for active sessions."""
+        path = "/api/session/active"
+        async with self._http() as client:
+            response = await client.get(self._url(path), timeout=self._timeout)
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Session status response was not valid JSON.") from exc
+        active = self._data(body, {})
+        if not isinstance(active, dict):
+            raise OpenCodeError("Session status response was not a JSON object.")
+        return {
+            str(session_id): {"type": "busy", "status": entry}
+            for session_id, entry in active.items()
+        }
+
+    async def get_session_todos(
+        self, session_id: str, *, directory: str | Path | None = None
+    ) -> list[dict]:
+        # opencode v2 no longer exposes a per-session todo endpoint.
+        return []
+
+    # -- prompting -------------------------------------------------------
+
+    async def _switch_model(self, session_id: str, ref: dict) -> None:
+        path = f"/api/session/{session_id}/model"
+        async with self._http() as client:
+            response = await client.post(
+                self._url(path), json={"model": ref}, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
+        self._session_selection.setdefault(session_id, {})["model"] = _model_key(ref)
+
+    async def _switch_agent(self, session_id: str, agent: str) -> None:
+        path = f"/api/session/{session_id}/agent"
+        async with self._http() as client:
+            response = await client.post(
+                self._url(path), json={"agent": agent}, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
+        self._session_selection.setdefault(session_id, {})["agent"] = agent
+
+    async def _ensure_selection(
+        self, session_id: str, *, agent: str | None, model: dict | None
+    ) -> None:
+        selection = self._session_selection.setdefault(session_id, {})
+        ref = _model_ref(model)
+        if ref is not None and selection.get("model") != _model_key(ref):
+            await self._switch_model(session_id, ref)
+        if agent and selection.get("agent") != agent:
+            await self._switch_agent(session_id, agent)
+
+    async def _prompt(self, session_id: str, text: str) -> None:
+        path = f"/api/session/{session_id}/prompt"
+        async with self._http() as client:
+            response = await client.post(
+                self._url(path), json={"text": text}, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
+
+    async def _wait(self, session_id: str) -> None:
+        path = f"/api/experimental/session/{session_id}/wait"
+        async with self._http() as client:
+            response = await client.post(self._url(path), timeout=self._timeout)
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
 
     async def send_prompt(
         self,
@@ -252,76 +463,45 @@ class OpenCodeClient:
         model: dict | None = None,
         directory: str | Path | None = None,
     ) -> str:
-        path = f"/session/{session_id}/message"
-        payload: dict = {"parts": [{"type": "text", "text": text}]}
-        if agent is not None:
-            payload["agent"] = agent
-        if model is not None:
-            payload["model"] = model
-
-        async with self._http() as client:
-            response = await client.post(
-                self._url(path),
-                params=self._params(directory),
-                json=payload,
-                timeout=self._timeout,
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("POST", path, response)
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Prompt response was not valid JSON.") from exc
-        if not isinstance(body, dict):
-            raise OpenCodeError("Prompt response was not a JSON object.")
-
-        info = body.get("info") or {}
-        if isinstance(info, dict) and info.get("error"):
-            raise OpenCodeError(f"opencode reported an error: {info['error']}")
-
-        parts = body.get("parts") or []
-        chunks = [
-            part["text"]
-            for part in parts
-            if isinstance(part, dict)
-            and part.get("type") == "text"
-            and isinstance(part.get("text"), str)
-        ]
-        return "\n".join(chunks).strip()
+        await self._ensure_selection(session_id, agent=agent, model=model)
+        await self._prompt(session_id, text)
+        await self._wait(session_id)
+        return await self._latest_assistant_text(session_id)
 
     async def prompt_async(
         self, session_id: str, text: str, *, agent: str | None = None
     ) -> None:
-        path = f"/session/{session_id}/prompt_async"
-        payload: dict = {"parts": [{"type": "text", "text": text}]}
-        if agent is not None:
-            payload["agent"] = agent
-
-        async with self._http() as client:
-            response = await client.post(
-                self._url(path),
-                params=self._params(),
-                json=payload,
-                timeout=self._timeout,
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("POST", path, response)
+        await self._ensure_selection(session_id, agent=agent, model=None)
+        await self._prompt(session_id, text)
 
     async def abort(self, session_id: str) -> None:
-        path = f"/session/{session_id}/abort"
+        path = f"/api/session/{session_id}/interrupt"
         async with self._http() as client:
             response = await client.post(
-                self._url(path), params=self._params(), timeout=self._timeout
+                self._url(path), params={"resume": "false"}, timeout=self._timeout
             )
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
 
+    async def compact_session(
+        self, session_id: str, *, model: dict | None = None
+    ) -> None:
+        path = f"/api/session/{session_id}/compact"
+        async with self._http() as client:
+            response = await client.post(
+                self._url(path), json={}, timeout=self._timeout
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("POST", path, response)
+
+    # -- messages --------------------------------------------------------
+
     async def list_messages(self, session_id: str) -> list[dict]:
-        path = f"/session/{session_id}/message"
+        path = f"/api/session/{session_id}/message"
+        params = {"limit": str(MESSAGE_LIST_LIMIT), "order": "asc"}
         async with self._http() as client:
             response = await client.get(
-                self._url(path), params=self._params(), timeout=self._timeout
+                self._url(path), params=params, timeout=self._timeout
             )
         if response.status_code >= 400:
             self._raise_for_status("GET", path, response)
@@ -329,81 +509,61 @@ class OpenCodeClient:
             body = response.json()
         except ValueError as exc:
             raise OpenCodeError("Message list response was not valid JSON.") from exc
-        if not isinstance(body, list):
+        data = self._data(body, [])
+        if not isinstance(data, list):
             raise OpenCodeError("Message list response was not a JSON array.")
-        return body
+        return data
+
+    @staticmethod
+    def _ordered(messages: list[dict]) -> list[dict]:
+        return sorted(
+            (message for message in messages if isinstance(message, dict)),
+            key=_created,
+        )
+
+    async def _latest_assistant_text(self, session_id: str) -> str:
+        messages = self._ordered(await self.list_messages(session_id))
+        last_user = -1
+        for index, message in enumerate(messages):
+            if message.get("type") == "user":
+                last_user = index
+        chunks: list[str] = []
+        for message in messages[last_user + 1 :]:
+            chunks.extend(_assistant_text(message))
+        return "\n".join(chunks).strip()
 
     async def get_turn_assistant_parts(
         self, session_id: str, *, directory: str | Path | None = None
     ) -> list[dict]:
-        path = f"/session/{session_id}/message"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Message list response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Message list response was not a JSON array.")
-        last_user_index = -1
-        for index, message in enumerate(body):
-            if not isinstance(message, dict):
-                continue
-            info = message.get("info")
-            if isinstance(info, dict) and info.get("role") == "user":
-                last_user_index = index
-        if last_user_index < 0:
-            for message in reversed(body):
-                if not isinstance(message, dict):
-                    continue
-                info = message.get("info")
-                if not isinstance(info, dict) or info.get("role") != "assistant":
-                    continue
-                raw_parts = message.get("parts")
-                if isinstance(raw_parts, list) and raw_parts:
-                    return [part for part in raw_parts if isinstance(part, dict)]
-            return []
+        messages = self._ordered(await self.list_messages(session_id))
+        last_user = -1
+        for index, message in enumerate(messages):
+            if message.get("type") == "user":
+                last_user = index
         parts: list[dict] = []
-        for message in body[last_user_index + 1 :]:
-            if not isinstance(message, dict):
-                continue
-            info = message.get("info")
-            if not isinstance(info, dict) or info.get("role") != "assistant":
-                continue
-            raw_parts = message.get("parts")
-            if isinstance(raw_parts, list):
-                parts.extend(part for part in raw_parts if isinstance(part, dict))
+        for message in messages[last_user + 1 :]:
+            parts.extend(_assistant_parts(message))
         return parts
 
     async def get_last_assistant_message(
         self, session_id: str, *, directory: str | Path | None = None
     ) -> dict | None:
-        path = f"/session/{session_id}/message"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Message list response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Message list response was not a JSON array.")
-        for message in reversed(body):
-            if not isinstance(message, dict):
-                continue
-            info = message.get("info")
-            if not isinstance(info, dict) or info.get("role") != "assistant":
-                continue
-            parts = message.get("parts")
-            if isinstance(parts, list) and parts:
+        messages = self._ordered(await self.list_messages(session_id))
+        for message in reversed(messages):
+            if message.get("type") == "assistant":
                 return message
+        return None
+
+    async def get_last_activity(
+        self, session_id: str, *, directory: str | Path | None = None
+    ) -> dict | None:
+        message = await self.get_last_assistant_message(session_id, directory=directory)
+        if message is None:
+            return None
+        parts = _assistant_parts(message)
+        for part in reversed(parts):
+            if part.get("type") in {"text", "reasoning", "tool"}:
+                return part
         return None
 
     async def get_session_diff(
@@ -413,10 +573,10 @@ class OpenCodeClient:
         message_id: str | None = None,
         directory: str | Path | None = None,
     ) -> list[dict]:
-        path = f"/session/{session_id}/diff"
-        params = self._params(directory)
+        path = f"/api/session/{session_id}/diff"
+        params: dict[str, str] = {}
         if message_id is not None:
-            params["messageID"] = str(message_id)
+            params["from"] = str(message_id)
         async with self._http() as client:
             response = await client.get(
                 self._url(path), params=params, timeout=self._timeout
@@ -427,77 +587,29 @@ class OpenCodeClient:
             body = response.json()
         except ValueError as exc:
             raise OpenCodeError("Session diff response was not valid JSON.") from exc
-        if not isinstance(body, list):
+        data = self._data(body, [])
+        if not isinstance(data, list):
             raise OpenCodeError("Session diff response was not a JSON array.")
-        return body
+        return data
 
-    async def get_last_activity(
-        self, session_id: str, *, directory: str | Path | None = None
-    ) -> dict | None:
-        path = f"/session/{session_id}/message"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Message list response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Message list response was not a JSON array.")
-        for message in reversed(body):
-            if not isinstance(message, dict):
-                continue
-            info = message.get("info")
-            if not isinstance(info, dict) or info.get("role") != "assistant":
-                continue
-            parts = message.get("parts")
-            if not isinstance(parts, list) or not parts:
-                continue
-            for part in reversed(parts):
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") in {"step-start", "step-finish"}:
-                    continue
-                return part
-            return None
-        return None
+    # -- location & filesystem ------------------------------------------
 
     async def get_path(self, *, directory: str | Path | None = None) -> dict:
-        path = "/path"
+        path = "/api/location"
         async with self._http() as client:
             response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
+                self._url(path),
+                params=self._location_params(directory),
+                timeout=self._timeout,
             )
         if response.status_code >= 400:
             self._raise_for_status("GET", path, response)
         try:
             body = response.json()
         except ValueError as exc:
-            raise OpenCodeError("Path response was not valid JSON.") from exc
+            raise OpenCodeError("Location response was not valid JSON.") from exc
         if not isinstance(body, dict):
-            raise OpenCodeError("Path response was not a JSON object.")
-        return body
-
-    async def list_directory(
-        self, path: str, *, directory: str | Path | None = None
-    ) -> list[dict]:
-        target = "/file"
-        params = {"path": path, "directory": str(directory or path)}
-        async with self._http() as client:
-            response = await client.get(
-                self._url(target), params=params, timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", target, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Directory listing response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Directory listing response was not a JSON array.")
+            raise OpenCodeError("Location response was not a JSON object.")
         return body
 
     async def default_directory(self, *, directory: str | Path | None = None) -> str:
@@ -512,196 +624,102 @@ class OpenCodeClient:
                 return value
         return "/"
 
-    async def list_models(self) -> list[dict]:
-        providers_path = "/config/providers"
-        provider_path = "/provider"
+    @staticmethod
+    def _join_path(base: str, name: str) -> str:
+        cleaned = (name or "").rstrip("/\\")
+        if not cleaned:
+            return base
+        if cleaned.startswith("/") or (len(cleaned) > 1 and cleaned[1] == ":"):
+            return cleaned
+        separator = "\\" if "\\" in base and "/" not in base else "/"
+        trimmed = (base or "").rstrip("/\\")
+        return f"{trimmed}{separator}{cleaned}" if trimmed else cleaned
+
+    async def list_directory(
+        self, path: str, *, directory: str | Path | None = None
+    ) -> list[dict]:
+        target = "/api/fs/list"
+        base = str(path)
+        params = {"path": base}
+        params.update(self._location_params(directory if directory is not None else path))
         async with self._http() as client:
-            providers_response = await client.get(
-                self._url(providers_path),
-                params=self._params(),
-                timeout=self._timeout,
+            response = await client.get(
+                self._url(target), params=params, timeout=self._timeout
             )
-            provider_response = await client.get(
-                self._url(provider_path),
-                params=self._params(),
-                timeout=self._timeout,
-            )
-        if providers_response.status_code >= 400:
-            self._raise_for_status("GET", providers_path, providers_response)
-
+        if response.status_code >= 400:
+            self._raise_for_status("GET", target, response)
         try:
-            body = providers_response.json()
+            body = response.json()
         except ValueError as exc:
-            raise OpenCodeError("Providers response was not valid JSON.") from exc
-        if not isinstance(body, dict):
-            raise OpenCodeError("Providers response was not a JSON object.")
-        providers = body.get("providers")
-        if not isinstance(providers, list):
-            raise OpenCodeError("Providers response did not contain a providers list.")
+            raise OpenCodeError("Directory listing response was not valid JSON.") from exc
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("Directory listing response was not a JSON array.")
+        entries: list[dict] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            raw_path = str(entry.get("path") or "")
+            entry_type = entry.get("type")
+            absolute = self._join_path(base, raw_path)
+            name = Path(raw_path.rstrip("/\\")).name if raw_path else base
+            entries.append(
+                {
+                    "name": name,
+                    "path": absolute,
+                    "absolute": absolute,
+                    "type": entry_type,
+                    "ignored": bool(entry.get("ignored")),
+                }
+            )
+        return entries
 
-        connected: list | None = None
-        if provider_response.status_code < 400:
-            try:
-                provider_body = provider_response.json()
-            except ValueError:
-                provider_body = None
-            if isinstance(provider_body, dict):
-                raw_connected = provider_body.get("connected")
-                if isinstance(raw_connected, list) and raw_connected:
-                    connected = raw_connected
-        connected_ids = {str(item) for item in connected} if connected else None
+    # -- models, providers, agents --------------------------------------
 
+    async def list_models(self) -> list[dict]:
+        path = "/api/model"
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path),
+                params=self._location_params(),
+                timeout=self._timeout,
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Model response was not valid JSON.") from exc
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("Model response did not contain a model list.")
         models: list[dict] = []
-        for provider in providers:
-            if not isinstance(provider, dict):
+        for entry in data:
+            if not isinstance(entry, dict):
                 continue
-            provider_id = str(provider.get("id") or "")
-            if connected_ids is not None and provider_id not in connected_ids:
+            if entry.get("enabled") is False:
                 continue
-            raw_models = provider.get("models")
-            if isinstance(raw_models, dict):
-                entries = list(raw_models.items())
-            elif isinstance(raw_models, list):
-                entries = [
-                    (entry.get("id") if isinstance(entry, dict) else "", entry)
-                    for entry in raw_models
-                ]
-            else:
-                entries = []
-            for key, entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                model_id = str(entry.get("modelID") or entry.get("id") or key or "")
-                resolved_provider = str(entry.get("providerID") or provider_id)
-                if not model_id or not resolved_provider:
-                    continue
-                name = str(entry.get("name") or model_id)
-                models.append(
-                    {
-                        "providerID": resolved_provider,
-                        "modelID": model_id,
-                        "name": name,
-                    }
-                )
+            model_id = str(entry.get("modelID") or entry.get("id") or "")
+            provider_id = str(entry.get("providerID") or "")
+            if not model_id or not provider_id:
+                continue
+            models.append(
+                {
+                    "providerID": provider_id,
+                    "modelID": model_id,
+                    "name": str(entry.get("name") or model_id),
+                }
+            )
         models.sort(key=lambda item: (item["providerID"], item["modelID"]))
         return models
 
-    async def list_sessions(
-        self, *, directory: str | Path | None = None, limit: int = 50
-    ) -> list[dict]:
-        path = "/session"
-        params = self._params(directory)
-        params["limit"] = str(limit)
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=params, timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Session list response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Session list response was not a JSON array.")
-        return body
-
-    async def get_session(self, session_id: str) -> dict:
-        path = f"/session/{session_id}"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Session response was not valid JSON.") from exc
-        if not isinstance(body, dict):
-            raise OpenCodeError("Session response was not a JSON object.")
-        return body
-
-    async def get_session_status(self) -> dict:
-        path = "/session/status"
-        async with self._http() as client:
-            response = await client.get(self._url(path), timeout=self._timeout)
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Session status response was not valid JSON.") from exc
-        if not isinstance(body, dict):
-            raise OpenCodeError("Session status response was not a JSON object.")
-        return body
-
-    async def get_session_todos(
-        self, session_id: str, *, directory: str | Path | None = None
-    ) -> list[dict]:
-        path = f"/session/{session_id}/todo"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Session todo response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Session todo response was not a JSON array.")
-        return body
-
-    async def _session_model(self, session_id: str) -> tuple[str, str] | None:
-        try:
-            session = await self.get_session(session_id)
-        except OpenCodeError:
-            return None
-        resolved = _normalize_model(session.get("model"))
-        return resolved
-
-    async def compact_session(
-        self, session_id: str, *, model: dict | None = None
-    ) -> None:
-        path = f"/api/session/{session_id}/compact"
-        try:
-            async with self._http() as client:
-                response = await client.post(self._url(path), timeout=self._timeout)
-            if response.status_code >= 400:
-                self._raise_for_status("POST", path, response)
-            return
-        except OpenCodeError as exc:
-            original_error = exc
-
-        resolved = _normalize_model(model)
-        if resolved is None:
-            resolved = await self._session_model(session_id)
-        if resolved is None:
-            raise original_error
-
-        provider_id, model_id = resolved
-        summarize_path = f"/session/{session_id}/summarize"
-        async with self._http() as client:
-            response = await client.post(
-                self._url(summarize_path),
-                params=self._params(),
-                json={
-                    "providerID": provider_id,
-                    "modelID": model_id,
-                    "auto": True,
-                },
-                timeout=self._timeout,
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("POST", summarize_path, response)
-
     async def get_mcp_status(self, *, directory: str | Path | None = None) -> dict:
-        path = "/mcp"
+        path = "/api/mcp"
         async with self._http() as client:
             response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
+                self._url(path),
+                params=self._location_params(directory),
+                timeout=self._timeout,
             )
         if response.status_code >= 400:
             self._raise_for_status("GET", path, response)
@@ -709,89 +727,102 @@ class OpenCodeClient:
             body = response.json()
         except ValueError as exc:
             raise OpenCodeError("MCP response was not valid JSON.") from exc
-        if not isinstance(body, dict):
-            raise OpenCodeError("MCP response was not a JSON object.")
-        return body
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("MCP response did not contain a server list.")
+        servers: dict = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            if not name:
+                continue
+            servers[name] = {"status": _mcp_status_label(entry.get("status"))}
+        return servers
 
     async def list_tool_ids(self, *, directory: str | Path | None = None) -> list[str]:
-        path = "/experimental/tool/ids"
-        async with self._http() as client:
-            response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
-            )
-        if response.status_code >= 400:
-            self._raise_for_status("GET", path, response)
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise OpenCodeError("Tool id response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Tool id response was not a JSON array.")
-        return [str(item) for item in body]
+        # opencode v2 no longer exposes a flat tool id list.
+        return []
 
-    async def reply_permission(self, request_id: str, reply: str) -> None:
+    # -- permissions -----------------------------------------------------
+
+    async def reply_permission(
+        self, request_id: str, reply: str, *, session_id: str
+    ) -> None:
         if reply not in VALID_PERMISSION_REPLIES:
             valid = ", ".join(sorted(VALID_PERMISSION_REPLIES))
             raise ValueError(f"reply must be one of {valid}, got {reply!r}.")
-        path = f"/permission/{request_id}/reply"
+        path = f"/api/session/{session_id}/permission/{request_id}/reply"
         async with self._http() as client:
             response = await client.post(
                 self._url(path),
-                params=self._params(),
-                json={"reply": reply},
+                json={"decision": reply},
                 timeout=self._timeout,
             )
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
 
-    async def list_questions(
+    async def list_permissions(
         self, *, directory: str | Path | None = None
     ) -> list[dict]:
-        path = "/question"
+        path = "/api/permission/request"
         async with self._http() as client:
             response = await client.get(
-                self._url(path), params=self._params(directory), timeout=self._timeout
+                self._url(path),
+                params=self._location_params(directory),
+                timeout=self._timeout,
             )
         if response.status_code >= 400:
             self._raise_for_status("GET", path, response)
         try:
             body = response.json()
         except ValueError as exc:
-            raise OpenCodeError("Question list response was not valid JSON.") from exc
-        if not isinstance(body, list):
-            raise OpenCodeError("Question list response was not a JSON array.")
-        return body
+            raise OpenCodeError("Permission list response was not valid JSON.") from exc
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("Permission list response was not a JSON array.")
+        return data
 
-    async def reply_question(
-        self,
-        request_id: str,
-        answers: list,
-        *,
-        directory: str | Path | None = None,
+    # -- forms (the v2 question mechanism) --------------------------------
+
+    async def list_forms(self, *, directory: str | Path | None = None) -> list[dict]:
+        path = "/api/form"
+        async with self._http() as client:
+            response = await client.get(
+                self._url(path),
+                params=self._location_params(directory),
+                timeout=self._timeout,
+            )
+        if response.status_code >= 400:
+            self._raise_for_status("GET", path, response)
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise OpenCodeError("Form list response was not valid JSON.") from exc
+        data = self._data(body, [])
+        if not isinstance(data, list):
+            raise OpenCodeError("Form list response was not a JSON array.")
+        return data
+
+    async def reply_form(
+        self, form_id: str, answer: dict, *, session_id: str
     ) -> None:
-        path = f"/question/{request_id}/reply"
+        path = f"/api/session/{session_id}/form/{form_id}/reply"
         async with self._http() as client:
             response = await client.post(
-                self._url(path),
-                params=self._params(directory),
-                json={"answers": answers},
-                timeout=self._timeout,
+                self._url(path), json={"answer": answer}, timeout=self._timeout
             )
         if response.status_code >= 400:
             self._raise_for_status("POST", path, response)
 
-    async def reject_question(
-        self, request_id: str, *, directory: str | Path | None = None
-    ) -> None:
-        path = f"/question/{request_id}/reject"
+    async def cancel_form(self, form_id: str, *, session_id: str) -> None:
+        path = f"/api/session/{session_id}/form/{form_id}"
         async with self._http() as client:
-            response = await client.post(
-                self._url(path),
-                params=self._params(directory),
-                timeout=self._timeout,
-            )
+            response = await client.delete(self._url(path), timeout=self._timeout)
         if response.status_code >= 400:
-            self._raise_for_status("POST", path, response)
+            self._raise_for_status("DELETE", path, response)
+
+    # -- events ----------------------------------------------------------
 
     async def _iter_sse(self, response: httpx.Response) -> AsyncIterator[dict]:
         parser = _SSEParser()
@@ -806,13 +837,12 @@ class OpenCodeClient:
     async def stream_events(
         self, *, directory: str | Path | None = None
     ) -> AsyncIterator[dict]:
-        path = "/event"
+        path = "/api/event"
         headers = {"Accept": "text/event-stream"}
         async with self._http() as client:
             async with client.stream(
                 "GET",
                 self._url(path),
-                params=self._params(directory),
                 headers=headers,
                 timeout=None,
             ) as response:

@@ -43,6 +43,73 @@ def _patch_async_client(monkeypatch, handler):
 def _fake_config(monkeypatch):
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", "123456:FAKE-TOKEN")
     monkeypatch.setattr(config, "ADMIN_USER_ID", 12345)
+    monkeypatch.delenv("OPENCODE_VOICE_CHAT_ID", raising=False)
+    monkeypatch.setattr(
+        send_media.database, "get_chat_id_for_directory", lambda directory: 12345
+    )
+
+
+def test_resolve_chat_id_explicit_wins(monkeypatch):
+    monkeypatch.setenv("OPENCODE_VOICE_CHAT_ID", "222")
+    assert send_media.resolve_chat_id(111, "ses_x") == 111
+
+
+def test_resolve_chat_id_env(monkeypatch):
+    monkeypatch.setenv("OPENCODE_VOICE_CHAT_ID", "222")
+    monkeypatch.setattr(send_media.database, "get_user_by_session_id", lambda sid: None)
+    monkeypatch.setattr(
+        send_media.database, "get_chat_id_for_directory", lambda directory: 333
+    )
+    assert send_media.resolve_chat_id(None, "ses_x") == 222
+
+
+def test_resolve_chat_id_from_session(monkeypatch):
+    monkeypatch.setattr(
+        send_media.database,
+        "get_user_by_session_id",
+        lambda sid: {"telegram_id": 444},
+    )
+    assert send_media.resolve_chat_id(None, "ses_x") == 444
+
+
+def test_resolve_chat_id_from_directory(monkeypatch):
+    monkeypatch.setattr(send_media.database, "get_user_by_session_id", lambda sid: None)
+    seen: dict = {}
+
+    def fake_directory(directory):
+        seen["directory"] = directory
+        return 555
+
+    monkeypatch.setattr(send_media.database, "get_chat_id_for_directory", fake_directory)
+    assert send_media.resolve_chat_id(None, "ses_x") == 555
+    assert seen["directory"] == send_media.os.getcwd()
+
+
+def test_resolve_chat_id_unresolved_raises(monkeypatch):
+    monkeypatch.setattr(send_media.database, "get_user_by_session_id", lambda sid: None)
+    monkeypatch.setattr(
+        send_media.database, "get_chat_id_for_directory", lambda directory: None
+    )
+    with pytest.raises(send_media.SendMediaError):
+        send_media.resolve_chat_id(None, "ses_x")
+
+
+@pytest.mark.asyncio
+async def test_send_file_unresolved_recipient_raises(monkeypatch, tmp_path):
+    target = tmp_path / "shot.png"
+    target.write_bytes(b"x")
+    monkeypatch.setattr(send_media.database, "get_user_by_session_id", lambda sid: None)
+    monkeypatch.setattr(
+        send_media.database, "get_chat_id_for_directory", lambda directory: None
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request should be sent")
+
+    _patch_async_client(monkeypatch, handler)
+    with pytest.raises(send_media.SendMediaError):
+        await send_media.send_file(target)
+
 
 
 @pytest.mark.asyncio

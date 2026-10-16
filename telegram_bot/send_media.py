@@ -11,11 +11,13 @@ import argparse
 import asyncio
 import logging
 import mimetypes
+import os
 from typing import Optional
 
 import httpx
 
 import config
+from telegram_bot import database
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +56,25 @@ def _max_bytes() -> int:
     return int(config.MEDIA_MAX_MB) * 1024 * 1024
 
 
-def _target_chat(chat_id: Optional[int]) -> int:
-    return int(chat_id) if chat_id is not None else int(config.ADMIN_USER_ID)
+def resolve_chat_id(
+    chat_id: Optional[int] = None, session_id: Optional[str] = None
+) -> int:
+    if chat_id is not None:
+        return int(chat_id)
+    env_chat = os.environ.get("OPENCODE_VOICE_CHAT_ID", "").strip()
+    if env_chat.lstrip("-").isdigit():
+        return int(env_chat)
+    if session_id:
+        row = database.get_user_by_session_id(session_id)
+        if row is not None:
+            return int(row["telegram_id"])
+    resolved = database.get_chat_id_for_directory(os.getcwd())
+    if resolved is not None:
+        return resolved
+    raise SendMediaError(
+        "Could not determine the Telegram recipient for this file. "
+        "Pass --chat-id or set OPENCODE_VOICE_CHAT_ID."
+    )
 
 
 def _parse_response(response: httpx.Response) -> dict:
@@ -75,6 +94,7 @@ async def send_file(
     *,
     caption: Optional[str] = None,
     chat_id: Optional[int] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
     resolved = resolve_media_path(path)
     if resolved.stat().st_size > _max_bytes():
@@ -84,7 +104,7 @@ async def send_file(
     token = config.require_telegram_token()
     method, mime = choose_method(resolved)
     field = "photo" if method == "sendPhoto" else "document"
-    data: dict = {"chat_id": str(_target_chat(chat_id))}
+    data: dict = {"chat_id": str(resolve_chat_id(chat_id, session_id))}
     if caption:
         data["caption"] = caption
     url = f"{TELEGRAM_API_BASE}/bot{token}/{method}"
@@ -100,6 +120,7 @@ def send_file_sync(
     *,
     caption: Optional[str] = None,
     chat_id: Optional[int] = None,
+    session_id: Optional[str] = None,
 ) -> dict:
     resolved = resolve_media_path(path)
     if resolved.stat().st_size > _max_bytes():
@@ -109,7 +130,7 @@ def send_file_sync(
     token = config.require_telegram_token()
     method, mime = choose_method(resolved)
     field = "photo" if method == "sendPhoto" else "document"
-    data: dict = {"chat_id": str(_target_chat(chat_id))}
+    data: dict = {"chat_id": str(resolve_chat_id(chat_id, session_id))}
     if caption:
         data["caption"] = caption
     url = f"{TELEGRAM_API_BASE}/bot{token}/{method}"
@@ -127,16 +148,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser = argparse.ArgumentParser(
         prog="python -m telegram_bot.send_media",
-        description="Send a local file to the configured Telegram admin.",
+        description=(
+            "Send a local file to the Telegram user whose opencode session "
+            "owns the current directory (or an explicit --chat-id)."
+        ),
     )
     parser.add_argument("path", help="Path to the file to send.")
     parser.add_argument("--caption", default=None, help="Optional caption.")
     parser.add_argument(
         "--chat-id", dest="chat_id", type=int, default=None, help="Target chat id."
     )
+    parser.add_argument(
+        "--session-id",
+        dest="session_id",
+        default=None,
+        help="opencode session id to resolve the recipient from.",
+    )
     args = parser.parse_args(argv)
     try:
-        send_file_sync(args.path, caption=args.caption, chat_id=args.chat_id)
+        send_file_sync(
+            args.path,
+            caption=args.caption,
+            chat_id=args.chat_id,
+            session_id=args.session_id,
+        )
     except SendMediaError as exc:
         logger.error("Failed to send media: %s", exc)
         return 1

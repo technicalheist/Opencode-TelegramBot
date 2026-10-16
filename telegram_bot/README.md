@@ -34,6 +34,8 @@ Configuration keys:
 | `OPENCODE_DIRECTORY` | Working directory for opencode sessions.          |
 | `OPENCODE_AGENT`     | Agent used for prompts (default `build`).         |
 | `OPENCODE_TIMEOUT`   | Seconds for a blocking prompt (default `600`).    |
+| `OPENCODE_SERVER_USERNAME` | Basic auth username for the default server (default `opencode`). |
+| `OPENCODE_SERVER_PASSWORD` | Basic auth password for `opencode serve`/`web` (required by opencode v2; used for localhost too). |
 
 ## Run
 
@@ -44,10 +46,11 @@ The single launcher starts both the opencode server and the bot:
 ```
 
 It installs the global MCP tool + skill, stops any stale `opencode serve` on the
-configured port, starts a fresh `opencode serve --port … --hostname …`, waits for
-`GET /global/health`, then runs the bot; the server it started is stopped on
-exit. The bot uses long polling, seeds the admin, creates `data/` and `media/`,
-and runs a background SSE listener for permission and question events.
+configured port, starts a fresh `opencode serve --port … --hostname 0.0.0.0`
+(passing `OPENCODE_SERVER_PASSWORD`), waits for `GET /api/info`, then runs the
+bot; the server it started is stopped on exit. The bot uses long polling, seeds the admin,
+creates `data/` and `media/`, and runs a background SSE listener for permission
+(`permission.v2.asked`) and question (`form.created`) events.
 
 If you run your own opencode server, skip the launcher:
 
@@ -153,17 +156,19 @@ same owner/admin gate; `/get <id>` continues to work.
 
 ## Outbound media (Phase 4.2)
 
-After a prompt completes, the bot inspects the latest assistant message and the
+After a prompt completes, the bot inspects the latest assistant turn and the
 session diff and sends any produced media back to the user:
 
-- `file` parts are fetched from their `url` (`data:`, `file:`, or `http(s)`; the
-  local opencode server is allowed) and sent as a photo when the mime/extension
-  is `image/*` (except GIF), otherwise as a document.
-- Files created or modified by the task are collected from `patch` parts
-  (`files`) and `GET /session/{id}/diff` (`path`), filtered to media extensions
-  (`png, jpg, jpeg, gif, webp, bmp, svg, mp4, mov, webm, mkv, mp3, wav, ogg,
-  m4a, flac, pdf`), and only sent when they exist inside the session directory
-  and are within `MEDIA_MAX_MB`.
+- Files changed by the task are collected from assistant `snapshot.files`, legacy
+  `patch` parts (`files`), and `GET /api/session/{id}/diff`, filtered to media
+  extensions (`png, jpg, jpeg, gif, webp, bmp, svg, mp4, mov, webm, mkv, mp3,
+  wav, ogg, m4a, flac, pdf`), and only sent when they exist inside the session
+  directory and are within `MEDIA_MAX_MB`. Images are sent as photos (except
+  GIF), everything else as documents.
+- Legacy `file` parts (opencode v1) are still handled: their `url` (`data:`,
+  `file:`, or `http(s)`, including the local opencode server) is fetched with the
+  client's credentials when it is same-origin, so media served by the server
+  works with v2 basic auth.
 
 Downloads enforce the `MEDIA_MAX_MB` cap (aborting on `Content-Length` or
 streamed size). Filesystem paths are rejected unless contained by the session
@@ -177,13 +182,19 @@ In addition to the pull-based method above, an explicit path is installed
 globally at bot startup so the agent can deliberately send a file:
 
 - `telegram_bot/send_media.py` is both a CLI and a reusable API:
-  `python -m telegram_bot.send_media "<absolute path>" [--caption "..."] [--chat-id ID]`.
+  `python -m telegram_bot.send_media "<absolute path>" [--caption "..."] [--chat-id ID] [--session-id SES]`.
   It enforces `MEDIA_MAX_MB`, posts images as photos (except GIF) and everything
-  else as documents, and defaults the chat to `ADMIN_USER_ID`.
-- `telegram_bot/mcp_server.py` is a local stdio MCP server exposing the
-  `telegram_send_file(path, caption?)` tool. It uses the `mcp` SDK's `FastMCP`
-  when available and otherwise falls back to a dependency-free JSON-RPC stdio
-  server.
+  else as documents. The recipient is resolved in order: explicit `--chat-id` →
+  `OPENCODE_VOICE_CHAT_ID` → `--session-id`'s owner → the user whose opencode
+  session owns the current directory (the agent's shell runs in the session
+  directory). If none resolves, it **errors instead of sending to the admin**.
+- `telegram_bot/mcp_server.py` is a dependency-free local stdio MCP server
+  exposing the `telegram_send_file(path, caption?)` tool. The recipient is
+  resolved from `CallToolRequest.params._meta.sessionID` when opencode provides
+  it, otherwise from the MCP process working directory (opencode spawns the
+  server per directory, so its cwd is the session directory) via
+  `database.get_chat_id_for_directory`; a missing or unknown session is not a
+  reason to send to the admin.
 - `telegram_bot/opencode_setup.py` installs both, idempotently, on startup:
   it merges an `mcp.telegram` entry into `~/.config/opencode/opencode.json`
   (preserving other keys, skipping invalid JSON) and writes
@@ -207,26 +218,27 @@ HTML, while the accompanying text message uses the HTML version.
 
 ## Permissions
 
-A background supervisor keeps one SSE listener per distinct session working
-directory: `GET /event?directory=<dir>` is directory-scoped, so events for a
-session in `D:\Projects\jcp` only arrive on a stream subscribed with that
-directory. The supervisor reconciles the set of listeners from
-`config.OPENCODE_DIRECTORY` plus every authenticated session's directory
-(re-checked every ~10s and immediately when a session/workdir changes), starting
-and cancelling listeners as needed.
+A background supervisor keeps one SSE listener per opencode server. In opencode
+v2 `GET /api/event` is a global stream (it carries every session's events,
+including the `location` of each event), so one listener per server is enough;
+the supervisor reconciles the server set from `config.OPENCODE_BASE_URL` plus
+every authenticated session's server (re-checked every ~10s and immediately when
+a session/server is added or removed).
 
-When opencode asks for permission (`permission.asked`), the bot sends an inline
-keyboard with **Allow once**, **Always**, and **Reject**. Tapping a button calls
-`POST /permission/{requestID}/reply` and resumes the agent; the original message
-is edited to show the decision. Questions (`question.asked`) are likewise
-surfaced from whichever directory's stream carries them. Prompts are serialized
+When opencode asks for permission (`permission.v2.asked`), the bot records the
+request's session, sends an inline keyboard with **Allow once**, **Always**, and
+**Reject**, and on tap calls
+`POST /api/session/{sessionID}/permission/{requestID}/reply` to resume the agent;
+the original message is edited to show the decision. Pending permissions are also
+reconciled at startup via `GET /api/permission/request`. Prompts are serialized
 per Telegram user with an `asyncio.Lock`.
 
 ## Question prompts (Phase 5)
 
-opencode's `question` tool blocks the agent until answered. The SSE listener
-handles `question.asked` and, via `database.get_user_by_session_id`, sends the
-question to the owning user with inline buttons:
+opencode's `question` tool blocks the agent until answered. In v2 the tool
+creates a **form** (emitted as `form.created` with `metadata.kind == "question"`).
+The SSE listener, via `database.get_user_by_session_id`, sends the question to the
+owning user with inline buttons:
 
 - single-select: one button per option (`q:a:<qidx>:<oidx>`) that submits
   immediately;
@@ -234,16 +246,17 @@ question to the owning user with inline buttons:
   `✅`) plus `✅ Done` (`q:d:<qidx>`);
 - free text: `✏️ Type answer` (`q:x:<qidx>`) is always available - it sets
   `awaiting_text`, and the next `text_message` is consumed as the answer;
-- `🚫 Skip` (`q:r`) rejects the whole request via
-  `POST /question/{requestID}/reject`.
+- `🚫 Skip` (`q:r`) cancels the whole form via
+  `DELETE /api/session/{sessionID}/form/{formID}`.
 
 Answers are collected in order and submitted with
-`POST /question/{requestID}/reply` as `{"answers": [[...], ...]}`. State lives
-in `PENDING_QUESTIONS` keyed by Telegram id; `question.replied` /
-`question.rejected` events clear it. On startup `reconcile_questions` lists each
-stored session's pending questions (`GET /question?directory=...`) so a question
-that arrived before a restart is still surfaced. Callback data stays within
-Telegram's 64-byte limit.
+`POST /api/session/{sessionID}/form/{formID}/reply` as
+`{"answer": {field_key: value}}` (a list for multi-select fields). State lives
+in `PENDING_QUESTIONS` keyed by Telegram id; `form.replied` / `form.cancelled`
+events clear it. On startup `reconcile_questions` lists each stored session's
+pending forms (`GET /api/form?location[directory]=...`) so a question that
+arrived before a restart is still surfaced. Callback data stays within Telegram's
+64-byte limit.
 
 While a question is pending, plain text messages are never forwarded to
 opencode: any typed text is always taken as a free-text answer for the current
@@ -299,26 +312,27 @@ can register more servers and switch between them:
 
 Clients are cached per base URL in `bot_data["opencode_clients"]` via
 `_client(context, server_row)`; the default client is used whenever the resolved
-server matches `OPENCODE_BASE_URL`. Event listeners are keyed by
-`(base_url, directory)` so questions/permissions from every server are surfaced,
-and permission replies are routed back to the server that asked. A server in a
-Docker container reaches the host via `http://host.docker.internal:4096` (or a
-LAN URL).
+server matches `OPENCODE_BASE_URL`. Event listeners are keyed by base URL (v2's
+`/api/event` is global), so questions/permissions from every server are surfaced,
+and permission replies are routed to the session on the server that asked. A
+server in a Docker container reaches the host via
+`http://host.docker.internal:4096` (or a LAN URL).
 
 ## Command palette (Phase 3.5)
 
-- `/models` fetches connected providers and their models, renders them as
+- `/models` fetches enabled models (`GET /api/model`) and renders them as
   paginated inline buttons (8 per page) and stores the selection **per
   (user, server)** in `user_models` (the default server also mirrors
   `users.model_provider` / `users.model_id`). Switching servers never carries a
-  model over; an unset server uses its default until one is chosen. The next
-  prompt sends `{"providerID","modelID"}` to opencode. Because provider/model
-  ids can exceed Telegram's 64-byte `callback_data` limit, buttons carry a short
-  token (`mdl:m0`, `mdl:pg:1`) that maps to the full id in memory.
+  model over; an unset server uses its default until one is chosen. The selection
+  is applied with `POST /api/session/{id}/model` and `.../agent` only when it
+  changed. Because provider/model ids can exceed Telegram's 64-byte
+  `callback_data` limit, buttons carry a short token (`mdl:m0`, `mdl:pg:1`) that
+  maps to the full id in memory.
 - `/workdir` opens an interactive directory browser (see below).
 - `/compact` calls `POST /api/session/{id}/compact` for the active session.
-- `/mcp` shows each MCP server with its connection status plus the tool ids
-  from `/experimental/tool/ids`.
+- `/mcp` shows each MCP server with its connection status from `GET /api/mcp`.
+  opencode v2 has no flat tool-id endpoint, so no tool list is shown.
 
 ## Working-directory browser (Phase 3.6)
 
@@ -326,12 +340,13 @@ The working directory is a path **on the selected opencode server**, not on the
 bot host (the server may be macOS/Linux or Windows). It is stored **per
 (user, server)** in `user_workdirs`, so switching servers never carries a path
 over; a server with no stored workdir uses that server's default from `GET
-/path`. `/workdir` (no argument) opens the browser at the effective workdir;
-`/workdir <path>` opens the browser directly at `<path>` with no local
+/api/location`. `/workdir` (no argument) opens the browser at the effective
+workdir; `/workdir <path>` opens the browser directly at `<path>` with no local
 validation — the server's listing is the validation. The browser shows the
 absolute path, the number of subdirectories, and a preview of up to eight files
 with the total file count, all from the server's
-`GET /file?path=<abs>&directory=<abs>` listing (ignored entries are hidden).
+`GET /api/fs/list?path=<abs>&location[directory]=<abs>` listing (entries are
+relative names joined onto the requested path; `ignored` entries are hidden).
 
 Inline buttons:
 
@@ -352,35 +367,34 @@ Browse state is kept in memory in `WORKDIR_BROWSE` keyed by Telegram id (owner,
 server base URL, path, page, children, files), so it is lost when the bot
 restarts; pressing a stale button tells the user to run `/workdir` again. Buttons
 are bound to the user who opened the browser; other users are rejected. A server
-error (non-2xx from `/file`, e.g. a missing directory) is shown as
+error (non-2xx from `/api/fs/list`, e.g. a missing directory) is shown as
 `❌ Could not browse <path>.`
 
 A stored workdir that is no longer browsable on the current server is healed:
 `ensure_session` and `/workdir` (no argument) fall back to that server's default
-(`GET /path`) and rewrite the stored value for that (user, server) pair; a stored
-session is reused only when both its server and its directory match.
+(`GET /api/location`) and rewrite the stored value for that (user, server) pair;
+a stored session is reused only when both its server and its directory match.
 
 ## Task status (Phase 3.7)
 
 `/status` reports the ongoing task for the user's active opencode session. It
-combines `GET /session/status` (the server's `busy` / `retry` / `idle` state)
-with an in-memory `ACTIVE_TASKS` record of the prompt currently being awaited
-(session id, prompt, start time). A task is considered ongoing when the server
-reports `busy`/`retry` for that session or a local task is in flight.
+combines `GET /api/session/active` (the server's active sessions) with an
+in-memory `ACTIVE_TASKS` record of the prompt currently being awaited (session
+id, prompt, start time). A task is considered ongoing when the server reports the
+session as active or a local task is in flight.
 
-The reply shows the session id, the status (`busy`, `retry (attempt N): ...`, or
-`running` when only the local task exists), the elapsed time (or `Elapsed
-unknown`), the prompt, and the session todo list from
-`GET /session/{id}/todo` with per-item icons (`⬜ pending`, `🔄 in_progress`,
-`✅ completed`, `❌ cancelled`) plus a `done/total` summary. When nothing is
-running it replies `No ongoing task found.`
+The reply shows the session id, the status (`busy` or `running` when only the
+local task exists), the elapsed time (or `Elapsed unknown`), the prompt, and the
+session todo list with per-item icons (`⬜ pending`, `🔄 in_progress`,
+`✅ completed`, `❌ cancelled`) plus a `done/total` summary. opencode v2 no longer
+exposes a per-session todo endpoint, so the todo section is empty until an
+equivalent lands. When nothing is running it replies `No ongoing task found.`
 
 `ACTIVE_TASKS` is set immediately before the blocking prompt call and cleared in
 a `finally`, so both the text and voice flows are covered and it is always reset
 on success or error. The reply also includes an `Activity:` line derived from the
 last meaningful part of the latest assistant message (`reasoning`, `text`, or
-`tool:<name>`), which is useful because this server's `/session/status` stays
-empty for v1 sessions while busy.
+`tool:<name>`).
 
 The bot runs PTB with `concurrent_updates(True)` so `/status`, permission
 callbacks, and other commands are processed while a prompt is being awaited;
