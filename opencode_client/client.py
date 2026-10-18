@@ -19,7 +19,9 @@ MESSAGE_LIST_LIMIT = 200
 
 
 class OpenCodeError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -269,7 +271,8 @@ class OpenCodeClient:
         )
         snippet = response.text[:500]
         raise OpenCodeError(
-            f"{method} {path} failed with status {response.status_code}: {snippet}"
+            f"{method} {path} failed with status {response.status_code}: {snippet}",
+            status=response.status_code,
         )
 
     async def close(self) -> None:

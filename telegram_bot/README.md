@@ -35,24 +35,27 @@ Configuration keys:
 | `OPENCODE_AGENT`     | Agent used for prompts (default `build`).         |
 | `OPENCODE_TIMEOUT`   | Seconds for a blocking prompt (default `600`).    |
 | `OPENCODE_SERVER_USERNAME` | Basic auth username for the default server (default `opencode`). |
-| `OPENCODE_SERVER_PASSWORD` | Basic auth password for `opencode serve`/`web` (required by opencode v2; used for localhost too). |
+| `OPENCODE_SERVER_PASSWORD` | Basic auth password for the opencode background service (required by opencode v2; used for localhost too). |
 
 ## Run
 
-The single launcher starts both the opencode server and the bot:
+The launcher expects an already-running opencode server. Start `opencode service start`
+yourself first (with `OPENCODE_SERVER_PASSWORD` set to the `.env` value), then:
 
 ```powershell
 .venv\Scripts\python -m telegram_bot
 ```
 
-It installs the global MCP tool + skill, stops any stale `opencode serve` on the
-configured port, starts a fresh `opencode serve --port … --hostname 0.0.0.0`
-(passing `OPENCODE_SERVER_PASSWORD`), waits for `GET /api/info`, then runs the
-bot; the server it started is stopped on exit. The bot uses long polling, seeds the admin,
-creates `data/` and `media/`, and runs a background SSE listener for permission
-(`permission.v2.asked`) and question (`form.created`) events.
+It installs the global MCP tool + skill, waits (up to 30 s) for `GET /api/info`
+at `OPENCODE_BASE_URL` (exiting with a clear error when the server is down),
+then runs the bot; in webhook mode it also starts and stops the cloudflared
+tunnel. It never starts, stops, or restarts the opencode server. The bot uses long
+polling, seeds the admin, creates `data/` and `media/`, and runs a background
+SSE listener for permission (`permission.v2.asked`) and question
+(`form.created`) events.
 
-If you run your own opencode server, skip the launcher:
+To skip the launcher (no health wait, no cloudflared), run the bot module
+directly:
 
 ```powershell
 .venv\Scripts\python -m telegram_bot.bot
@@ -74,8 +77,7 @@ public HTTPS URL. Empty `TELEGRAM_WEBHOOK_URL` keeps long polling.
 For a background launcher managed from the shell, use `scripts\bot.ps1
 start|stop|status` (Windows) or `./scripts/bot.sh start|stop|status`
 (Linux/macOS). Pid file in `run/bot.pid`, logs in `logs/` (gitignored); `stop`
-also stops the opencode server on the configured port and never touches
-cloudflared.
+stops only the bot and never touches cloudflared or the opencode server.
 
 ## Commands
 

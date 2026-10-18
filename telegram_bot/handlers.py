@@ -47,6 +47,10 @@ AUTH_APPROVED_DM_TEXT = (
 AUTH_REJECTED_DM_TEXT = "Your access request was declined."
 AUTH_NOT_AUTHORIZED_TEXT = "Not authorized"
 OPENCODE_ERROR_TEXT = "Sorry, opencode could not complete that request."
+OPENCODE_SERVER_DOWN_TEXT = (
+    "opencode server is not running.\n"
+    "Start it with: opencode service start"
+)
 UNEXPECTED_ERROR_TEXT = "Something went wrong while contacting opencode."
 EMPTY_REPLY_TEXT = "opencode returned an empty response."
 EMPTY_TRANSCRIPT_TEXT = "I couldn't hear any speech in that audio."
@@ -1167,14 +1171,28 @@ async def ensure_session(
         same_server = server_id is None or existing_server_id == server_id
         same_directory = str(existing["directory"]) == target_directory
         if same_server and same_directory:
-            return str(existing["session_id"])
-        logger.info(
-            "Stored session for user %s does not match server %s / directory %s; recreating",
-            telegram_id,
-            server_id,
-            target_directory,
-        )
-        database.delete_opencode_session(user_id)
+            session_id = str(existing["session_id"])
+            try:
+                await client.get_session(session_id)
+            except OpenCodeError as exc:
+                if getattr(exc, "status", None) != 404:
+                    raise
+                logger.warning(
+                    "Stored opencode session %s for user %s no longer exists on the server; creating a new one",
+                    session_id,
+                    telegram_id,
+                )
+                database.delete_opencode_session(user_id)
+            else:
+                return session_id
+        else:
+            logger.info(
+                "Stored session for user %s does not match server %s / directory %s; recreating",
+                telegram_id,
+                server_id,
+                target_directory,
+            )
+            database.delete_opencode_session(user_id)
     session = await client.create_session(
         title=f"Telegram {telegram_id}",
         agent=config.OPENCODE_AGENT,
@@ -1506,6 +1524,13 @@ async def _send_outbound_media(
         _mark_sent(session_id, key)
 
 
+async def _opencode_reachable(client) -> bool:
+    try:
+        return bool(await client.health())
+    except Exception:
+        return False
+
+
 async def _process_prompt(
     update: Update, context: ContextTypes.DEFAULT_TYPE, user_row: sqlite3.Row, prompt: str
 ) -> None:
@@ -1516,6 +1541,9 @@ async def _process_prompt(
         server_row = _user_server(telegram_id)
         client = _client(context, server_row)
         server_id = int(server_row["id"]) if server_row is not None else None
+        if not await _opencode_reachable(client):
+            await message.reply_text(OPENCODE_SERVER_DOWN_TEXT)
+            return
         model = model_payload(telegram_id, server_id)
         directory = await current_directory(user_row, client, server_id)
         placeholder = None

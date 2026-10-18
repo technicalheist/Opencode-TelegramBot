@@ -89,7 +89,6 @@ OPENCODE_BASE_URL: str = _env("OPENCODE_BASE_URL", "http://localhost:4096")
 OPENCODE_DIRECTORY: Path = _resolve_path(os.getenv("OPENCODE_DIRECTORY"), ".")
 OPENCODE_AGENT: str = _env("OPENCODE_AGENT", "build")
 OPENCODE_TIMEOUT: float = _parse_opencode_timeout()
-OPENCODE_SERVE_COMMAND: str = _env("OPENCODE_SERVE_COMMAND", "opencode")
 # opencode v2 protects `serve`/`web` with HTTP basic auth when a password is set.
 # The username defaults to "opencode" (opencode's own default). These credentials
 # apply to the default server (OPENCODE_BASE_URL) for localhost too.

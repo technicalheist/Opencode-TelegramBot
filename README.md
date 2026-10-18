@@ -6,8 +6,8 @@ text or spoken replies, share images/files with the agent, receive files it
 creates, and approve tool-permission requests with inline buttons.
 
 > Status: works and is used daily. Requires a running **opencode v2** server
-> (`opencode serve`); the launcher starts one for you and enables the v2 HTTP
-> basic auth (`OPENCODE_SERVER_PASSWORD`).
+> (`opencode service start`) that you start yourself with the v2 HTTP basic auth
+> (`OPENCODE_SERVER_PASSWORD`) set; the launcher waits for it.
 
 ## Features
 
@@ -61,14 +61,14 @@ This project targets the **opencode v2 HTTP API** (`/api/...`): prompts are
 admitted asynchronously and awaited with `experimental.session.wait`, permissions
 are session-scoped, and the agent's `question` tool arrives as a **form**
 (`form.created`). The v2 `serve`/`web` server requires HTTP basic auth
-(`OPENCODE_SERVER_PASSWORD`), which the launcher passes to the spawned server and
-the client uses automatically for `OPENCODE_BASE_URL` (localhost included).
+(`OPENCODE_SERVER_PASSWORD`); start your server with it set, and the client uses
+the same value automatically for `OPENCODE_BASE_URL` (localhost included).
 
 ## Prerequisites
 
 - **Python 3.14+**
-- The **opencode** CLI on your `PATH` (the single launcher starts `opencode serve`
-  for you; you can also run your own server)
+- The **opencode** CLI on your `PATH` (start `opencode service start` yourself;
+  the launcher waits for it)
 - A **Telegram bot token** from [@BotFather](https://t.me/BotFather)
 - An **OpenRouter API key** for STT (only needed for voice input)
 - Your Telegram **numeric user id** (get it from [@userinfobot](https://t.me/userinfobot))
@@ -103,13 +103,12 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 | `STT_PROVIDER` | `api` | Reserved |
 | `TTS_VOICE` | `en-US-AriaNeural` | Edge TTS voice |
 | `TTS_RATE` / `TTS_VOLUME` / `TTS_PITCH` | `+0%` / `+0%` / `+0Hz` | Edge TTS prosody |
-| `OPENCODE_BASE_URL` | `http://localhost:4096` | Default opencode server URL (registered as `Local`; its port starts the local server, which binds `0.0.0.0`) |
+| `OPENCODE_BASE_URL` | `http://localhost:4096` | Default opencode server URL (registered as `Local`; the launcher waits for this server to be healthy) |
 | `OPENCODE_DIRECTORY` | repo root | Default working directory (fallback when the server's `GET /path` is unavailable) |
 | `OPENCODE_AGENT` | `build` | opencode agent to use |
 | `OPENCODE_TIMEOUT` | `600` | Seconds to wait for a blocking prompt |
-| `OPENCODE_SERVE_COMMAND` | `opencode` | Command used to launch `opencode serve` |
 | `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP basic auth username for the default server (opencode v2) |
-| `OPENCODE_SERVER_PASSWORD` | — | HTTP basic auth password for `opencode serve`/`web` (**required** by opencode v2; used for localhost too) |
+| `OPENCODE_SERVER_PASSWORD` | — | HTTP basic auth password for the opencode background service (**required** by opencode v2; used for localhost too) |
 | `MEDIA_MAX_MB` | `20` | Max size for bridged media |
 | `TELEGRAM_WEBHOOK_URL` | — | Public HTTPS base URL; **empty = long polling** |
 | `TELEGRAM_WEBHOOK_PORT` | `8080` | Local port the webhook server listens on |
@@ -120,35 +119,46 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 
 ## Run
 
-One command starts everything. `python -m telegram_bot`:
+Start the opencode server yourself, with the password from `.env`:
 
-1. installs the global MCP tool + skill (`~/.config/opencode/`) idempotently,
-2. stops any stale `opencode serve` on the configured port,
-3. starts `opencode serve --port … --hostname 0.0.0.0`,
-4. waits until the server is healthy (`GET /api/info`), then
-5. runs the Telegram bot (and stops the server it started on exit).
+```powershell
+$env:OPENCODE_SERVER_PASSWORD = "<password from .env>"
+opencode service start
+```
+
+Then run the launcher, which waits for that server:
 
 ```powershell
 .venv\Scripts\python -m telegram_bot
 ```
 
-Because the MCP config and skill are installed before the server starts, the
-freshly started opencode picks them up. The bot logs `Bot started` and begins
-long polling; open your bot in Telegram and send `/start`.
+`python -m telegram_bot`:
 
-`OPENCODE_SERVER_PASSWORD` is passed to the spawned `opencode serve` (and used
-by the bot as HTTP basic auth, with username `OPENCODE_SERVER_USERNAME`) so the
-default localhost server is protected too. opencode v2 requires this password.
+1. installs the global MCP tool + skill (`~/.config/opencode/`) idempotently,
+2. waits (up to 30 s) for the server at `OPENCODE_BASE_URL` to answer
+   `GET /api/info`; if the server is not running it exits with a clear error,
+3. runs the Telegram bot (in webhook mode it also starts the cloudflared tunnel
+   and stops it on exit).
 
-If you prefer to manage your own opencode server, start it yourself and run the
-bot directly:
+It never starts, stops, or restarts the opencode server. The bot logs `Bot started`
+and begins long polling; open your bot in Telegram and send `/start`.
+
+`OPENCODE_SERVER_PASSWORD` is used by the bot as HTTP basic auth (with username
+`OPENCODE_SERVER_USERNAME`) and must match the password the running
+server was started with. The bot always uses the `.env` value
+(`config` loads the root `.env` with `override=True`), so start the server with
+the same value. opencode v2 requires this password.
+
+Because opencode loads its config and skills once at startup, restart
+the opencode server (`opencode service restart`) after the first
+`python -m telegram_bot` run so it picks up the installed MCP config/skill.
+
+To skip the launcher (no health wait, no cloudflared), run the bot module
+directly:
 
 ```powershell
 .venv\Scripts\python -m telegram_bot.bot
 ```
-
-In that mode, restart opencode after the bot has installed the MCP config/skill
-so it loads them.
 
 ## Webhook mode (cloudflared)
 
@@ -161,8 +171,8 @@ By default the bot uses long polling (works offline, no public URL). Setting
   `TELEGRAM_WEBHOOK_SECRET` as the request secret;
 - the launcher starts `cloudflared tunnel --no-autoupdate run --token …` and
   waits for the public URL to respond (it continues with a warning if the
-  tunnel is not up yet), and stops cloudflared on exit alongside `opencode
-  serve`.
+  tunnel is not up yet), and stops cloudflared on exit (it does not manage
+  the opencode server, which runs separately).
 
 The Cloudflare side here is **remotely-managed**: a tunnel named
 `telegram-bot` with ingress `telegram-bot.shivrajan.com → http://localhost:8080`
@@ -179,7 +189,7 @@ Manage the launcher as a background process with the helper scripts:
 ```powershell
 scripts\bot.ps1 start     # start in the background (logs to logs\bot.out.log / logs\bot.err.log)
 scripts\bot.ps1 status    # launcher pid, opencode port, health
-scripts\bot.ps1 stop      # stop the bot and the opencode server it manages (never cloudflared)
+scripts\bot.ps1 stop      # stop only the bot
 ```
 
 ```bash
@@ -189,12 +199,12 @@ scripts\bot.ps1 stop      # stop the bot and the opencode server it manages (nev
 ```
 
 The pid file lives in `run/bot.pid` and logs in `logs/` (both gitignored).
-`start` runs the launcher, which restarts `opencode serve` on the configured port
-with the `.env` password and then starts the bot. `stop` also terminates **every**
-opencode server listening on the configured port; it never touches cloudflared —
-the launcher's own `finally` stops the tunnel it started. `status` checks
-`GET /api/info` with the configured basic auth and exits non-zero when nothing is
-running.
+`start` runs the launcher, which waits for the already-running `opencode serve`
+at `OPENCODE_BASE_URL` and then starts the bot. `stop` stops only the bot; the
+separately started opencode server is left untouched, and cloudflared is only
+ever stopped by the launcher's own `finally` (the tunnel it started). `status`
+checks `GET /api/info` with the configured basic auth and exits non-zero when
+nothing is running.
 
 ### Cross-platform
 
@@ -309,8 +319,9 @@ use fakes) and does not require a real bot token.
 
 | Symptom | Fix |
 | --- | --- |
+| `opencode server is not running. Start it with: opencode service start` | The bot could not reach `OPENCODE_BASE_URL`. Start the opencode server and try again. |
 | `Sorry, Opencode could not complete that request.` | Check the opencode v2 server is running with `OPENCODE_SERVER_PASSWORD` set and the selected model is valid (`/models`); see the bot log for the HTTP status. |
-| `401 Authentication required` | The running `opencode serve` has a different password than `.env`. Restart it (or use `python -m telegram_bot`, which passes the `.env` password through). If you also `export OPENCODE_SERVER_PASSWORD` in your shell, make sure it matches `.env` — the root `.env` is authoritative (`config` loads it with `override=True`). |
+| `401 Authentication required` | The running opencode server was started with a different password than `.env`. Restart it with `OPENCODE_SERVER_PASSWORD` set to the `.env` value. The bot always uses the `.env` value (root `.env` is authoritative; `config` loads it with `override=True`), so make sure both match. |
 | `/models` says "No models connected" | Usually the same `401` cause: the client is authenticated with a stale exported password. The root `.env` now overrides the shell, so restart the bot; if the server was started from a shell with a different value, restart it too. |
 | Replies never arrive | Ensure `OPENCODE_BASE_URL` points at your running server and its default directory (`GET /api/location`) is valid. |
 | Agent blocks on a permission prompt | Tap the Allow/Reject buttons, or set broader defaults in your opencode config. |

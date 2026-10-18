@@ -4,7 +4,6 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import httpx
-import pytest
 
 from telegram_bot import launcher
 
@@ -24,13 +23,6 @@ def _basic_header(username: str, password: str) -> str:
 
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     return f"Basic {token}"
-
-
-def test_parse_base_url_variants():
-    assert launcher.parse_base_url("http://localhost:4096") == ("localhost", 4096)
-    assert launcher.parse_base_url("http://127.0.0.1:5000") == ("127.0.0.1", 5000)
-    assert launcher.parse_base_url("http://example.test") == ("example.test", 4096)
-    assert launcher.parse_base_url("") == ("127.0.0.1", 4096)
 
 
 def test_is_healthy_true(monkeypatch):
@@ -112,100 +104,6 @@ def test_is_healthy_no_auth_without_password(monkeypatch):
     assert seen["authorization"] is None
 
 
-def test_server_env_includes_credentials(monkeypatch):
-    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_USERNAME", "opencode")
-    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "s3cret")
-
-    env = launcher.server_env()
-
-    assert env["OPENCODE_SERVER_PASSWORD"] == "s3cret"
-    assert env["OPENCODE_SERVER_USERNAME"] == "opencode"
-
-
-def test_server_env_omits_credentials_without_password(monkeypatch):
-    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
-    monkeypatch.setattr(launcher.config, "OPENCODE_SERVER_PASSWORD", "")
-
-    env = launcher.server_env()
-
-    assert "OPENCODE_SERVER_PASSWORD" not in env
-
-
-def test_build_serve_command_plain_executable(monkeypatch):
-    monkeypatch.setattr(
-        launcher.shutil, "which", lambda command: r"C:\tools\opencode.exe"
-    )
-
-    command = launcher.build_serve_command("127.0.0.1", 4096)
-
-    assert command == [
-        r"C:\tools\opencode.exe",
-        "serve",
-        "--port",
-        "4096",
-        "--hostname",
-        "127.0.0.1",
-    ]
-
-
-def test_build_serve_command_cmd_shim(monkeypatch):
-    monkeypatch.setattr(launcher.os, "name", "nt")
-    monkeypatch.setattr(
-        launcher.shutil, "which", lambda command: r"C:\nvm\opencode.cmd"
-    )
-    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
-
-    command = launcher.build_serve_command("127.0.0.1", 4096)
-
-    assert command == [
-        r"C:\Windows\System32\cmd.exe",
-        "/c",
-        r"C:\nvm\opencode.cmd",
-        "serve",
-        "--port",
-        "4096",
-        "--hostname",
-        "127.0.0.1",
-    ]
-
-
-def test_build_serve_command_missing(monkeypatch):
-    monkeypatch.setattr(launcher.shutil, "which", lambda command: None)
-    with pytest.raises(RuntimeError):
-        launcher.build_serve_command("127.0.0.1", 4096)
-
-
-def test_build_serve_command_posix_not_wrapped(monkeypatch):
-    monkeypatch.setattr(launcher.os, "name", "posix")
-    monkeypatch.setattr(
-        launcher.shutil, "which", lambda command: "/usr/local/bin/opencode"
-    )
-
-    command = launcher.build_serve_command("127.0.0.1", 4096)
-
-    assert command == [
-        "/usr/local/bin/opencode",
-        "serve",
-        "--port",
-        "4096",
-        "--hostname",
-        "127.0.0.1",
-    ]
-
-
-def test_build_serve_command_posix_does_not_wrap_cmd_like_name(monkeypatch):
-    monkeypatch.setattr(launcher.os, "name", "posix")
-    monkeypatch.setattr(
-        launcher.shutil, "which", lambda command: "/usr/local/bin/opencode.cmd"
-    )
-
-    command = launcher.build_serve_command("127.0.0.1", 4096)
-
-    assert command[0] == "/usr/local/bin/opencode.cmd"
-    assert command[1] == "serve"
-    assert "COMSPEC" not in command
-
-
 def test_popen_kwargs_posix(monkeypatch):
     monkeypatch.setattr(launcher.os, "name", "posix")
     assert launcher._popen_kwargs() == {"start_new_session": True}
@@ -230,39 +128,6 @@ def test_kill_pid_os_posix_uses_process_group(monkeypatch):
     launcher._kill_pid_os(42)
 
     assert calls and calls[0][0] == 42
-
-
-def test_stop_existing_server_no_pid(monkeypatch):
-    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [])
-    killed: list[int] = []
-    monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
-
-    assert launcher.stop_existing_server("http://x", 4096) is False
-    assert killed == []
-
-
-def test_stop_existing_server_terminates_tree(monkeypatch):
-    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [1234])
-    killed: list[int] = []
-    monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
-    monkeypatch.setattr(
-        launcher, "_wait_for_port_free", lambda port, timeout=10.0: True
-    )
-
-    assert launcher.stop_existing_server("http://x", 4096) is True
-    assert killed == [1234]
-
-
-def test_stop_existing_server_kills_all_listeners(monkeypatch):
-    monkeypatch.setattr(launcher, "find_listening_pids", lambda port: [11128, 12184])
-    killed: list[int] = []
-    monkeypatch.setattr(launcher, "_terminate_pid_tree", lambda pid: killed.append(pid))
-    monkeypatch.setattr(
-        launcher, "_wait_for_port_free", lambda port, timeout=10.0: True
-    )
-
-    assert launcher.stop_existing_server("http://x", 4096) is True
-    assert killed == [11128, 12184]
 
 
 def test_terminate_pid_tree_uses_psutil(monkeypatch):
@@ -294,31 +159,52 @@ def test_terminate_pid_tree_uses_psutil(monkeypatch):
     assert 2 in terminated
 
 
+def test_terminate_process_skips_finished(monkeypatch):
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        launcher, "_terminate_pid_tree", lambda pid: terminated.append(pid)
+    )
+    process = SimpleNamespace(pid=7, poll=lambda: 0)
+
+    launcher.terminate_process(process)
+
+    assert terminated == []
+
+
+def test_terminate_process_kills_pid_tree(monkeypatch):
+    terminated: list[int] = []
+    waited: list[int] = []
+    monkeypatch.setattr(
+        launcher, "_terminate_pid_tree", lambda pid: terminated.append(pid)
+    )
+
+    class FakeProcess:
+        pid = 7
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            waited.append(self.pid)
+
+    launcher.terminate_process(FakeProcess())
+
+    assert terminated == [7]
+    assert waited == [7]
+
+
 def _main_env(monkeypatch, calls, *, health=True, bot_raises=False):
     monkeypatch.setattr(launcher.config, "CLOUDFLARED_TUNNEL_TOKEN", "")
-    monkeypatch.setattr(launcher, "parse_base_url", lambda url: ("127.0.0.1", 4096))
     monkeypatch.setattr(
         launcher.opencode_setup,
         "install_all",
         lambda: calls.append("install") or {"mcp": True, "skill": True},
     )
     monkeypatch.setattr(
-        launcher, "stop_existing_server", lambda base, port: calls.append("stop") or False
-    )
-    monkeypatch.setattr(
-        launcher, "build_serve_command", lambda host, port: ["opencode", "serve"]
-    )
-    monkeypatch.setattr(
-        launcher,
-        "start_server",
-        lambda command: calls.append("start")
-        or SimpleNamespace(pid=1, poll=lambda: None),
-    )
-    monkeypatch.setattr(
         launcher, "wait_for_health", lambda base, **kw: calls.append("wait") or health
     )
     monkeypatch.setattr(
-        launcher, "terminate_server", lambda process, port: calls.append("terminate")
+        launcher, "terminate_process", lambda process: calls.append("terminate")
     )
 
     def fake_bot_main():
@@ -329,44 +215,32 @@ def _main_env(monkeypatch, calls, *, health=True, bot_raises=False):
     monkeypatch.setattr(launcher.bot, "main", fake_bot_main)
 
 
-def test_main_runs_in_order_and_cleans_up(monkeypatch):
+def test_main_runs_in_order_without_managing_the_server(monkeypatch):
     calls: list[str] = []
     _main_env(monkeypatch, calls)
 
     assert launcher.main() == 0
-    assert calls == ["install", "stop", "start", "wait", "bot", "terminate"]
+    assert calls == ["install", "wait", "bot"]
+    assert calls.count("terminate") == 0
 
 
-def test_main_binds_server_to_all_interfaces(monkeypatch):
-    calls: list[str] = []
-    _main_env(monkeypatch, calls)
-    seen: list[tuple[str, int]] = []
-    monkeypatch.setattr(
-        launcher,
-        "build_serve_command",
-        lambda host, port: seen.append((host, port)) or ["opencode", "serve"],
-    )
-
-    assert launcher.main() == 0
-    assert seen == [("0.0.0.0", 4096)]
-
-
-def test_main_terminates_when_bot_raises(monkeypatch):
-    calls: list[str] = []
-    _main_env(monkeypatch, calls, bot_raises=True)
-
-    assert launcher.main() == 1
-    assert calls[:4] == ["install", "stop", "start", "wait"]
-    assert "terminate" in calls
-
-
-def test_main_failed_health_returns_one_and_terminates(monkeypatch):
+def test_main_health_failure_leaves_bot_stopped(monkeypatch):
     calls: list[str] = []
     _main_env(monkeypatch, calls, health=False)
 
     assert launcher.main() == 1
+    assert calls == ["install", "wait"]
     assert "bot" not in calls
-    assert "terminate" in calls
+    assert calls.count("terminate") == 0
+
+
+def test_main_returns_one_when_bot_raises(monkeypatch):
+    calls: list[str] = []
+    _main_env(monkeypatch, calls, bot_raises=True)
+
+    assert launcher.main() == 1
+    assert calls == ["install", "wait", "bot"]
+    assert calls.count("terminate") == 0
 
 
 def _enable_webhook(monkeypatch, token="tok"):
@@ -444,7 +318,7 @@ def test_wait_for_tunnel_returns_false_on_timeout(monkeypatch):
     ) is False
 
 
-def test_main_starts_cloudflared_in_webhook_mode(monkeypatch):
+def test_main_starts_and_stops_cloudflared_in_webhook_mode(monkeypatch):
     calls: list[str] = []
     _main_env(monkeypatch, calls)
     _enable_webhook(monkeypatch)
@@ -465,17 +339,16 @@ def test_main_starts_cloudflared_in_webhook_mode(monkeypatch):
     )
 
     assert launcher.main() == 0
-    assert calls[:7] == [
+    assert calls == [
         "install",
-        "stop",
-        "start",
         "wait",
         "cf-build",
         "cf-start",
         "tunnel",
+        "bot",
+        "terminate",
     ]
-    assert calls[7] == "bot"
-    assert calls.count("terminate") == 2
+    assert calls.count("terminate") == 1
 
 
 def test_main_skips_cloudflared_when_disabled(monkeypatch):
@@ -489,4 +362,4 @@ def test_main_skips_cloudflared_when_disabled(monkeypatch):
 
     assert launcher.main() == 0
     assert started == []
-    assert calls.count("terminate") == 1
+    assert calls.count("terminate") == 0

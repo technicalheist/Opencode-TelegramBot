@@ -83,6 +83,7 @@ class FakeClient:
         self.reply_permission = AsyncMock()
         self.list_models = AsyncMock(return_value=[])
         self.list_sessions = AsyncMock(return_value=[])
+        self.get_session = AsyncMock(return_value={"id": "ses_existing"})
         self.compact_session = AsyncMock()
         self.get_mcp_status = AsyncMock(return_value={})
         self.list_tool_ids = AsyncMock(return_value=[])
@@ -104,6 +105,7 @@ class FakeClient:
         self.cancel_form = AsyncMock()
         self.list_forms = AsyncMock(return_value=[])
         self.list_permissions = AsyncMock(return_value=[])
+        self.health = AsyncMock(return_value=True)
         self.stream_events = None
 
 
@@ -657,7 +659,32 @@ async def test_ensure_session_reuses_existing(monkeypatch):
     session_id = await handlers.ensure_session(db.row, client)
 
     assert session_id == "ses_existing"
+    client.get_session.assert_awaited_once_with("ses_existing")
     client.create_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_recreates_when_stored_session_is_gone(monkeypatch):
+    from opencode_client import OpenCodeError
+
+    db = FakeDB(_row())
+    directory = str(handlers.config.OPENCODE_DIRECTORY)
+    db.sessions[1] = {"session_id": "ses_stale", "directory": directory}
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.get_session = AsyncMock(
+        side_effect=OpenCodeError(
+            "GET /api/session/ses_stale failed with status 404", status=404
+        )
+    )
+
+    session_id = await handlers.ensure_session(db.row, client)
+
+    assert session_id == "ses_new"
+    assert db.sessions[1]["session_id"] == "ses_new"
+    client.create_session.assert_awaited_once()
+    create_kwargs = client.create_session.await_args.kwargs
+    assert create_kwargs["directory"] == directory
 
 
 @pytest.mark.asyncio
@@ -1990,6 +2017,21 @@ async def test_process_prompt_clears_active_task_on_error(monkeypatch):
     await handlers.text_message(update, _context(client))
 
     assert 111 not in handlers.ACTIVE_TASKS
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_reports_when_server_is_down(monkeypatch):
+    db = FakeDB(_row())
+    monkeypatch.setattr(handlers, "database", db)
+    client = FakeClient()
+    client.health = AsyncMock(return_value=False)
+
+    update = _update(text="hi")
+    await handlers.text_message(update, _context(client))
+
+    assert handlers.OPENCODE_SERVER_DOWN_TEXT in update.effective_message.sent
+    client.create_session.assert_not_awaited()
+    client.send_prompt.assert_not_awaited()
 
 
 @pytest.mark.asyncio

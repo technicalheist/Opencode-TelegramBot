@@ -1,11 +1,12 @@
 #requires -Version 5.1
 #
-# Manage the opencode-voice launcher (opencode v2 server + Telegram bot).
+# Manage the opencode-voice launcher (Telegram bot; waits for the external
+# opencode server).
 #
-#   start  - launch `python -m telegram_bot` hidden; it restarts opencode serve
-#            on the configured port (with OPENCODE_SERVER_PASSWORD from .env)
-#            and then runs the bot. Logs go to logs/.
-#   stop   - stop the launcher and every opencode server listening on the port.
+#   start  - launch `python -m telegram_bot` hidden; it waits for the
+#            already-running opencode server and then runs the bot. Logs go
+#            to logs/.
+#   stop   - stop only the bot.
 #   status - report launcher, listener, and /api/info health (with basic auth).
 #
 [CmdletBinding()]
@@ -136,21 +137,6 @@ if ($Action -eq 'stop') {
         Write-Host "Bot is not running."
     }
     Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
-
-    $port = Get-Port
-    $listeners = Get-ListenerPids $port
-    if ($listeners.Count -gt 0) {
-        foreach ($listener in $listeners) {
-            try {
-                Stop-Process -Id $listener -Force -ErrorAction Stop
-                Write-Host "Stopped opencode server on port $port (pid $listener)."
-            } catch {
-                Write-Warning "Could not stop listener pid $listener"
-            }
-        }
-    } else {
-        Write-Host "No opencode server listening on port $port."
-    }
     exit 0
 }
 

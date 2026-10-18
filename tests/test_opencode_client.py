@@ -409,6 +409,29 @@ async def test_get_session_returns_dict(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_get_session_not_found_carries_status(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/session/ses_missing"
+        return _json_response(
+            {"_tag": "SessionNotFoundError", "message": "not found"}, status=404
+        )
+
+    with pytest.raises(OpenCodeError) as excinfo:
+        await _make(handler, tmp_path).get_session("ses_missing")
+    assert excinfo.value.status == 404
+
+
+@pytest.mark.asyncio
+async def test_get_session_other_error_carries_status(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"message": "boom"}, status=500)
+
+    with pytest.raises(OpenCodeError) as excinfo:
+        await _make(handler, tmp_path).get_session("ses_1")
+    assert excinfo.value.status == 500
+
+
+@pytest.mark.asyncio
 async def test_get_session_status_maps_active_to_busy(tmp_path):
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/session/active"

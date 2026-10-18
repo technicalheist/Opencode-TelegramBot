@@ -1,15 +1,17 @@
 #requires -Version 5.1
 #
-# Restart the opencode-voice stack in one shot:  stop -> start -> status
+# Restart the opencode-voice bot stack in one shot:  stop -> start -> status
 #
-#   stop   - kills the launcher and the opencode server on the configured port
-#   start  - relaunches `python -m telegram_bot` (which respawns opencode serve)
+#   stop   - stops only the bot (the separately started opencode server is left
+#            untouched)
+#   start  - relaunches `python -m telegram_bot` (which waits for the running
+#            opencode server)
 #   status - reports launcher / listener / health
 #
 # This exists because `stop` tears down the very process tree that carries the
 # Telegram conversation, so the three actions cannot be typed one at a time.
 # Everything therefore runs from a single detached process that keeps going
-# after the caller (and the server) disappears.
+# after the caller (and the bot) disappears.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart.ps1
@@ -22,8 +24,9 @@ param(
     [ValidateRange(0, 3600)]
     [int]$DelaySeconds = 20,
 
-    # Pause after `stop` (port needs to free up) and after `start` (server needs
-    # time to bind + become healthy) before we read status.
+    # Pause after `stop` (the bot needs to exit) and after `start` (the bot
+    # needs time to connect to the already-running opencode server) before we
+    # read status.
     [ValidateRange(0, 300)]
     [int]$SettleSeconds = 8
 )
@@ -106,7 +109,7 @@ if ($DelaySeconds -gt 0) {
 # --- 1. stop ---------------------------------------------------------------
 $stopCode = Invoke-Bot -Action 'stop'
 
-# --- settle: let the port free up -----------------------------------------
+# --- settle: let the bot exit ----------------------------------------------
 if ($SettleSeconds -gt 0) {
     Write-Log "Waiting $SettleSeconds s after stop..."
     Start-Sleep -Seconds $SettleSeconds
@@ -115,7 +118,7 @@ if ($SettleSeconds -gt 0) {
 # --- 2. start --------------------------------------------------------------
 $startCode = Invoke-Bot -Action 'start'
 
-# --- settle: let opencode serve bind and turn healthy ----------------------
+# --- settle: let the bot come up -------------------------------------------
 if ($SettleSeconds -gt 0) {
     Write-Log "Waiting $SettleSeconds s after start..."
     Start-Sleep -Seconds $SettleSeconds

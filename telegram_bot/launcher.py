@@ -13,7 +13,6 @@ import shutil
 import signal
 import subprocess
 import time
-import urllib.parse
 from typing import Optional
 
 import httpx
@@ -23,19 +22,7 @@ from telegram_bot import bot, opencode_setup
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 4096
-# The spawned ``opencode serve`` binds every interface so clients on the LAN,
-# in Docker, or in WSL can reach it; health checks still use OPENCODE_BASE_URL.
-SERVE_HOSTNAME = "0.0.0.0"
 HEALTH_PATHS = ("/api/info", "/api/health", "/global/health")
-
-
-def parse_base_url(base_url: str) -> tuple[str, int]:
-    parsed = urllib.parse.urlparse(base_url or "")
-    host = parsed.hostname or DEFAULT_HOST
-    port = parsed.port or DEFAULT_PORT
-    return host, int(port)
 
 
 def _health_auth() -> Optional[httpx.BasicAuth]:
@@ -66,74 +53,6 @@ def is_healthy(base_url: str, *, timeout: float = 2.0) -> bool:
         if body.get("healthy") is True or "version" in body or "pid" in body:
             return True
     return False
-
-
-def _find_pids_via_os(port: int) -> list[int]:
-    if os.name == "nt":
-        command = ["netstat", "-ano", "-p", "tcp"]
-    else:
-        command = ["lsof", "-ti", f"tcp:{port}"]
-    try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=10
-        )
-    except Exception:
-        logger.warning("Could not inspect listening sockets for port %s", port)
-        return []
-    pids: list[int] = []
-    if os.name != "nt":
-        for line in (result.stdout or "").splitlines():
-            line = line.strip()
-            if line.isdigit() and int(line) not in pids:
-                pids.append(int(line))
-        return pids
-    for line in (result.stdout or "").splitlines():
-        parts = line.split()
-        if len(parts) < 5 or parts[0].upper() != "TCP":
-            continue
-        if parts[3].upper() != "LISTENING":
-            continue
-        local_address = parts[1]
-        if ":" not in local_address:
-            continue
-        local_port = local_address.rsplit(":", 1)[1]
-        if local_port == str(port) and parts[4].isdigit():
-            pid = int(parts[4])
-            if pid not in pids:
-                pids.append(pid)
-    return pids
-
-
-def find_listening_pids(port: int) -> list[int]:
-    """Return every PID listening on ``port`` (across IPv4/IPv6 interfaces)."""
-    try:
-        import psutil
-    except Exception:
-        psutil = None
-    if psutil is not None:
-        try:
-            pids: list[int] = []
-            for connection in psutil.net_connections(kind="tcp"):
-                laddr = getattr(connection, "laddr", None)
-                if laddr is None:
-                    continue
-                if (
-                    getattr(laddr, "port", None) == port
-                    and getattr(connection, "status", None) == psutil.CONN_LISTEN
-                    and connection.pid
-                    and int(connection.pid) not in pids
-                ):
-                    pids.append(int(connection.pid))
-            if pids:
-                return pids
-        except Exception:
-            logger.warning("psutil net_connections failed; using OS fallback")
-    return _find_pids_via_os(port)
-
-
-def find_listening_pid(port: int) -> Optional[int]:
-    pids = find_listening_pids(port)
-    return pids[0] if pids else None
 
 
 def _kill_pid_os(pid: int) -> None:
@@ -185,86 +104,10 @@ def _terminate_pid_tree(pid: int) -> None:
     _kill_pid_os(pid)
 
 
-def _wait_for_port_free(port: int, *, timeout: float = 10.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not find_listening_pids(port):
-            return True
-        time.sleep(0.25)
-    return False
-
-
-def stop_existing_server(base_url: str, port: int) -> bool:
-    try:
-        pids = find_listening_pids(port)
-        if not pids:
-            return False
-        logger.info(
-            "Stopping existing opencode server(s) on port %s (pids %s)",
-            port,
-            ", ".join(str(pid) for pid in pids),
-        )
-        for pid in pids:
-            _terminate_pid_tree(pid)
-        if not _wait_for_port_free(port):
-            remaining = find_listening_pids(port)
-            logger.warning(
-                "Port %s still reported as listening after stop (pids %s)",
-                port,
-                ", ".join(str(pid) for pid in remaining) or "unknown",
-            )
-        return True
-    except Exception:
-        logger.exception("Failed while stopping existing server on port %s", port)
-        return False
-
-
-def build_serve_command(host: str, port: int) -> list[str]:
-    command = config.OPENCODE_SERVE_COMMAND
-    resolved = shutil.which(command)
-    if resolved is None:
-        raise RuntimeError(f"Could not find opencode command: {command!r}")
-    if os.name == "nt" and resolved.lower().endswith((".cmd", ".bat")):
-        shell = os.environ.get("COMSPEC", "cmd.exe")
-        return [
-            shell,
-            "/c",
-            resolved,
-            "serve",
-            "--port",
-            str(port),
-            "--hostname",
-            host,
-        ]
-    return [resolved, "serve", "--port", str(port), "--hostname", host]
-
-
 def _popen_kwargs() -> dict:
     if os.name == "nt":
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
-
-
-def server_env() -> dict:
-    """Environment for the opencode server, ensuring v2 basic auth is enabled.
-
-    ``config`` reads ``OPENCODE_SERVER_PASSWORD`` from the root ``.env``; pass it
-    explicitly so a freshly spawned ``opencode serve`` always enables auth even
-    if the variable was only loaded by python-dotenv (not exported).
-    """
-    env = os.environ.copy()
-    credentials = config.opencode_server_credentials()
-    if credentials is not None:
-        username, password = credentials
-        env["OPENCODE_SERVER_USERNAME"] = username
-        env["OPENCODE_SERVER_PASSWORD"] = password
-    return env
-
-
-def start_server(command: list[str], *, env: Optional[dict] = None) -> subprocess.Popen:
-    return subprocess.Popen(
-        command, cwd=str(_ROOT), env=env or server_env(), **_popen_kwargs()
-    )
 
 
 def wait_for_health(
@@ -302,7 +145,9 @@ def build_cloudflared_command() -> Optional[list[str]]:
 
 
 def start_cloudflared(command: list[str]) -> subprocess.Popen:
-    return start_server(command, env=os.environ.copy())
+    return subprocess.Popen(
+        command, cwd=str(_ROOT), env=os.environ.copy(), **_popen_kwargs()
+    )
 
 
 def wait_for_tunnel(
@@ -326,7 +171,7 @@ def wait_for_tunnel(
     return False
 
 
-def terminate_server(process: subprocess.Popen, port: int) -> None:
+def terminate_process(process: subprocess.Popen) -> None:
     try:
         if process.poll() is not None:
             return
@@ -339,7 +184,7 @@ def terminate_server(process: subprocess.Popen, port: int) -> None:
             except Exception:
                 pass
     except Exception:
-        logger.exception("Failed to terminate opencode server")
+        logger.exception("Failed to terminate process")
 
 
 def main() -> int:
@@ -348,23 +193,18 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     base_url = config.OPENCODE_BASE_URL
-    _, port = parse_base_url(base_url)
     try:
         result = opencode_setup.install_all()
         logger.info("opencode setup install result: %s", result)
     except Exception:
         logger.exception("opencode setup install failed")
-    process: Optional[subprocess.Popen] = None
     cloudflared_process: Optional[subprocess.Popen] = None
     try:
-        stop_existing_server(base_url, port)
-        command = build_serve_command(SERVE_HOSTNAME, port)
-        logger.info("Starting opencode server on %s:%s", SERVE_HOSTNAME, port)
-        process = start_server(command)
-        if not wait_for_health(base_url):
-            logger.error("opencode server did not become healthy at %s", base_url)
-            terminate_server(process, port)
-            process = None
+        if not wait_for_health(base_url, timeout=30.0):
+            logger.error(
+                "No running opencode server at %s; start it first (`opencode service start`)",
+                base_url,
+            )
             return 1
         logger.info("opencode server healthy at %s", base_url)
         if config.cloudflared_enabled():
@@ -389,9 +229,7 @@ def main() -> int:
         return 1
     finally:
         if cloudflared_process is not None:
-            terminate_server(cloudflared_process, 0)
-        if process is not None:
-            terminate_server(process, port)
+            terminate_process(cloudflared_process)
 
 
 if __name__ == "__main__":

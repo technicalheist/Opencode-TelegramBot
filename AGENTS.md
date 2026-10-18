@@ -203,6 +203,7 @@ starts (skip if already present).
       these up.
 
 ### Phase 7 - single launcher (opencode serve + bot) (CURRENT)
+Superseded by Phase 13: the launcher no longer starts or stops the server.
 One command starts both the opencode server and the Telegram bot, so the freshly
 installed MCP config/skill are loaded without a separate opencode restart.
 
@@ -214,8 +215,7 @@ installed MCP config/skill are loaded without a separate opencode restart.
          from `OPENCODE_BASE_URL`);
       4. wait until healthy, then run the bot;
       5. terminate the server we started on exit.
-- [ ] Config: `OPENCODE_SERVE_COMMAND` (default `opencode`); `psutil` added to
-      `requirements.txt` for port/PID detection and killing the process tree.
+- [ ] Config: `psutil` added to `requirements.txt` for process-tree termination.
 - [ ] `python -m telegram_bot` is the single command; `python -m telegram_bot.bot`
       still works for users who run `opencode serve` themselves.
 - [ ] Tests (no network): URL parse, health/running detection, kill decision,
@@ -267,7 +267,7 @@ tunnel so Telegram pushes updates to `telegram-bot.shivrajan.com`.
       otherwise `run_polling()`.
 - [ ] `launcher.main()` starts `cloudflared tunnel run --token <token>` (only in
       webhook mode), waits until the public URL responds, runs the bot, and
-      terminates cloudflared on exit alongside `opencode serve`.
+      terminates cloudflared on exit (the opencode server is managed externally).
 - [ ] Tunnel is remotely-managed (`config_src=cloudflare`); ingress
       `telegram-bot.shivrajan.com → http://localhost:<port>` is set via the
       Cloudflare API.
@@ -652,10 +652,11 @@ MEDIA_MAX_MB=20                # max size for inbound/outbound media bridging
 
 - opencode v2 protects `serve`/`web` with HTTP basic auth when
   `OPENCODE_SERVER_PASSWORD` is set (username defaults to `opencode`, overridable
-  via `OPENCODE_SERVER_USERNAME`). The launcher passes the password into the
-  spawned `opencode serve` process, and `OpenCodeClient` uses it automatically
-  for the default `OPENCODE_BASE_URL` (localhost included). Custom servers keep
-  their own credentials from the `servers` table.
+  via `OPENCODE_SERVER_USERNAME`). Start the server (`opencode service start`)
+  with the same value;
+  `OpenCodeClient` uses the `.env` credentials automatically for the default
+  `OPENCODE_BASE_URL` (localhost included). Custom servers keep their own
+  credentials from the `servers` table.
 
 - `.env.example` contains the same keys with placeholder values.
 - `config.py` resolves relative `DB_PATH`/`MEDIA_DIR` against the repo root and
@@ -699,8 +700,8 @@ opencode features require `is_authenticated = 1`.
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 
-# run the bot
-.venv\Scripts\python -m telegram_bot.bot
+# run the bot (start `opencode service start` yourself first, with the .env password)
+.venv\Scripts\python -m telegram_bot
 
 # tests
 .venv\Scripts\python -m pytest tests
@@ -764,8 +765,8 @@ is now required by `serve`/`web` (HTTP basic auth, username defaults to
       auth from config for `OPENCODE_BASE_URL`; `send_prompt` = switch model/agent
       (only when changed) → `prompt` → `experimental.wait` → concatenate the
       newest turn's assistant `content[].text`.
-- [x] Launcher health is `GET /api/info`; the spawned `opencode serve` receives
-      `OPENCODE_SERVER_PASSWORD`/`USERNAME` via `server_env()`.
+- [x] Launcher health is `GET /api/info` with the configured credentials; the
+      server is started externally.
 - [x] Events: one global `GET /api/event` stream per server; handlers accept
       `permission.v2.asked` and `form.created`/`form.replied`/`form.cancelled`.
 - [x] Permissions are replied on the session
@@ -779,6 +780,53 @@ is now required by `serve`/`web` (HTTP basic auth, username defaults to
 - [x] Outbound media: `file` parts are gone; changed files come from assistant
       `snapshot.files` (and `GET /api/session/{id}/diff?from=<msg_>`).
 - [x] Tests rewritten for the v2 shapes; no network.
+
+### Phase 13 - externally managed opencode server (DONE)
+The operator starts the opencode server (`opencode service start`, opencode v2's
+background service) themselves; the launcher no longer starts,
+stops, kills, or restarts it.
+
+- [x] `launcher.main()` waits up to 30 s for `GET /api/info` at
+      `OPENCODE_BASE_URL` (with the configured credentials) and returns 1 with a
+      clear error when the server is down — the bot never starts.
+- [x] Removed `OPENCODE_SERVE_COMMAND`, `parse_base_url`, the port/PID discovery
+      helpers, `stop_existing_server`, `build_serve_command`, `server_env`, and
+      `start_server`; `terminate_server` became `terminate_process` and is used
+      only for the cloudflared tunnel.
+- [x] Cloudflared tunnel management (webhook mode) is unchanged: the launcher
+      starts it, waits for the public URL, and terminates it on exit.
+- [x] `scripts/bot.ps1` / `bot.sh` `stop` stops only the bot; `status` still
+      reports the launcher pid, the opencode listener, and `/api/info` health.
+      `scripts/restart.ps1` restarts the bot only.
+- [x] Docs updated; tests rewritten (health wait, cloudflared lifecycle, no
+      opencode process management); no network.
+
+### Phase 14 - stale session self-heal (DONE)
+A stored session deleted server-side (e.g. opencode restarted with a fresh DB)
+made every prompt fail with the generic error. `ensure_session` now validates it
+before reuse.
+
+- [x] `OpenCodeError` carries an optional `status` code, set by
+      `_raise_for_status`.
+- [x] `ensure_session` checks a matching stored session with
+      `GET /api/session/{id}`; on a 404 it deletes the row and creates a fresh
+      session. Non-404 errors propagate without deleting the session.
+- [x] Tests: `get_session` 404/500 carry `status`; the reuse path awaiting the
+      check; the 404 recreate path.
+
+### Phase 15 - server-down notice (DONE)
+When the opencode server is unreachable, the prompt flow no longer falls through
+to the generic error: it tells the user how to start the server.
+
+- [x] `handlers._process_prompt` checks `client.health()` (guarded by
+      `_opencode_reachable`, which treats exceptions as down) before touching the
+      server and replies `OPENCODE_SERVER_DOWN_TEXT` — "opencode server is not
+      running. Start it with: opencode service start" — instead of prompting.
+- [x] Command corrections: opencode v2's start command is `opencode service
+      start` (the CLI has a `service` subcommand, not `serve`) — launcher log
+      message, READMEs, and the AGENTS.md run recipe updated.
+- [x] Tests: server-down prompt replies the notice and never creates a session or
+      sends a prompt; the fake client defaults to healthy.
 
 ## Definition of Done (Phase 3.5)
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# Manage the opencode-voice launcher (opencode v2 server + Telegram bot).
+# Manage the opencode-voice launcher (Telegram bot; waits for the external
+# opencode server).
 #
-#   start  - launch `python -m telegram_bot` in the background; it restarts
-#            opencode serve on the configured port (with OPENCODE_SERVER_PASSWORD
-#            from .env) and then runs the bot. Logs go to logs/.
-#   stop   - stop the launcher and every opencode server listening on the port.
+#   start  - launch `python -m telegram_bot` in the background; it waits for
+#            the already-running opencode server and then runs the bot. Logs
+#            go to logs/.
+#   stop   - stop only the bot.
 #   status - report launcher, listener, and /api/info health (with basic auth).
 #
 set -euo pipefail
@@ -106,16 +107,6 @@ case "$ACTION" in
       echo "Bot is not running."
     fi
     rm -f "$PIDFILE"
-
-    pids="$(listener_pids "$PORT")"
-    if [ -n "$pids" ]; then
-      for listener in $pids; do
-        kill "$listener" 2>/dev/null || true
-        echo "Stopped opencode server on port $PORT (pid $listener)."
-      done
-    else
-      echo "No opencode server listening on port $PORT."
-    fi
     exit 0
     ;;
   status)
