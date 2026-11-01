@@ -111,9 +111,10 @@ def test_popen_kwargs_posix(monkeypatch):
 
 def test_popen_kwargs_windows(monkeypatch):
     monkeypatch.setattr(launcher.os, "name", "nt")
-    assert launcher._popen_kwargs() == {
-        "creationflags": launcher.subprocess.CREATE_NEW_PROCESS_GROUP
-    }
+    monkeypatch.setattr(
+        launcher.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, raising=False
+    )
+    assert launcher._popen_kwargs() == {"creationflags": 0x00000200}
 
 
 def test_kill_pid_os_posix_uses_process_group(monkeypatch):

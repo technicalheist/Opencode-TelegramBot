@@ -396,6 +396,8 @@ def test_start_opencode_is_a_noop_when_already_healthy():
 
 
 def test_start_opencode_uses_comspec_for_cmd_shims(monkeypatch):
+    if os.name != "nt":
+        pytest.skip(".cmd shims only exist on Windows")
     monkeypatch.setattr(manager.os, "name", "nt")
     monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
     runs: list = []

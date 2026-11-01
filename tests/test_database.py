@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -813,6 +814,7 @@ def _authed_user(telegram_id, name="User"):
     return int(user["id"])
 
 
+@pytest.mark.skipif(os.name != "nt", reason="asserts Windows path semantics")
 def test_get_chat_id_for_directory_matches_and_normalizes(db_path):
     user_id = _authed_user(501, "Alice")
     database.set_opencode_session(user_id, "ses_a", "D:/projects/demo", None)

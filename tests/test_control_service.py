@@ -36,6 +36,7 @@ class FakeRunner:
 def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setenv(paths.CONFIG_DIR_OVERRIDE, str(tmp_path / "cfg"))
     monkeypatch.setenv(paths.ENV_FILE_OVERRIDE, str(tmp_path / "cfg" / ".env"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
 
