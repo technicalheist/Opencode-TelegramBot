@@ -21,6 +21,7 @@ from control.manager import PARENT_PID_ENV, Manager, ManagerError
 
 SUBCOMMANDS = (
     "serve",
+    "help",
     "bot",
     "mcp-server",
     "send-media",
@@ -289,6 +290,22 @@ def _cmd_version(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_help(args: argparse.Namespace) -> int:
+    topic = args.topic
+    parser = build_parser()
+    if not topic:
+        parser.print_help()
+        return 0
+    for action in parser._actions:
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict) and topic in choices:
+            choices[topic].print_help()
+            return 0
+    print(f"Unknown command: {topic}", file=sys.stderr)
+    print("Run `ocv help` for the command list.", file=sys.stderr)
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="opencode-voice",
@@ -296,6 +313,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command")
+
+    help_parser = sub.add_parser("help", help="show help for a command")
+    help_parser.add_argument("topic", nargs="?", default=None, help="command name")
+    help_parser.set_defaults(func=_cmd_help)
 
     serve = sub.add_parser("serve", help="run the panel (default)")
     serve.add_argument("--port", type=int, default=None)

@@ -7,4 +7,4 @@ a first run with no settings file must still be able to open the panel.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

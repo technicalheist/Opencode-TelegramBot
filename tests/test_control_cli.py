@@ -199,3 +199,20 @@ def test_unknown_subcommand_exits(capsys):
 def test_config_set_rejects_unknown_keys(capsys, isolated):
     assert cli.main(["config", "set", "NOPE=1"]) == 1
     assert "Unknown setting" in capsys.readouterr().err
+
+def test_help_lists_commands(capsys):
+    assert cli.main(["help"]) == 0
+    out = capsys.readouterr().out
+    assert "usage: opencode-voice" in out
+    assert "serve" in out and "service" in out
+
+
+def test_help_for_a_command(capsys):
+    assert cli.main(["help", "status"]) == 0
+    assert "opencode-voice status" in capsys.readouterr().out
+
+
+def test_help_rejects_an_unknown_command(capsys):
+    assert cli.main(["help", "nope"]) == 1
+    err = capsys.readouterr().err
+    assert "Unknown command: nope" in err

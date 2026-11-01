@@ -178,6 +178,7 @@ config directory:
 
 ```powershell
 ocv                                       # serve + open http://127.0.0.1:8787
+ocv help                                  # command list (ocv help <command> for one)
 ocv status                                # opencode / bot / mode
 ocv config list
 ocv config set LOG_LEVEL=DEBUG
