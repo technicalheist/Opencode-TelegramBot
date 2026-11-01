@@ -771,7 +771,7 @@ python -m venv .venv
 
 # install as a tool (gives `ocv` / `opencode-voice` on PATH)
 uv tool install --from . opencode-voice
-uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0a1" opencode-voice
+uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0" opencode-voice
 uv tool uninstall opencode-voice
 
 # tests

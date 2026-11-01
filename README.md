@@ -210,10 +210,10 @@ environment, so the generic top-level modules (`config`, `stt`, `tts`,
 
 ```bash
 # straight from a git tag (needs git, no artifacts to download)
-uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0a1" opencode-voice
+uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0" opencode-voice
 
 # straight from the release wheel (no git needed)
-uv tool install --from "https://github.com/technicalheist/Opencode-TelegramBot/releases/download/v0.1.0a1/opencode_voice-0.1.0a1-py3-none-any.whl" opencode-voice
+uv tool install --from "https://github.com/technicalheist/Opencode-TelegramBot/releases/download/v0.1.0/opencode_voice-0.1.0-py3-none-any.whl" opencode-voice
 
 # from a local checkout
 uv tool install --from . opencode-voice
