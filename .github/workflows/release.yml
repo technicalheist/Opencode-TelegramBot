@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Test
+        run: uv run --extra dev pytest -q
+
+      - name: Check the tag matches control.__version__
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(uv run python -c 'import control; print(control.__version__)')"
+          echo "tag=$tag version=$version"
+          test "$tag" = "$version"
+
+      - name: Build wheel and sdist
+        run: uv build
+
+      - name: Attach artifacts to the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

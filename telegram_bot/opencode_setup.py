@@ -29,6 +29,16 @@ def _write_config(config: dict) -> None:
     )
 
 
+def mcp_command() -> list[str]:
+    """Command opencode runs to start the MCP server."""
+    return [sys.executable, str(MCP_SERVER_PATH)]
+
+
+def send_media_command() -> list[str]:
+    """Command that sends a file when the MCP tool is unavailable."""
+    return [sys.executable, str(SEND_MEDIA_PATH)]
+
+
 def install_mcp_config() -> bool:
     if GLOBAL_CONFIG.exists():
         try:
@@ -50,14 +60,15 @@ def install_mcp_config() -> bool:
     if not isinstance(mcp, dict):
         mcp = {}
         config["mcp"] = mcp
-    if "telegram" in mcp:
-        return False
-    config.setdefault("$schema", CONFIG_SCHEMA)
-    mcp["telegram"] = {
+    desired = {
         "type": "local",
-        "command": [sys.executable, str(MCP_SERVER_PATH)],
+        "command": mcp_command(),
         "enabled": True,
     }
+    if mcp.get("telegram") == desired:
+        return False
+    config.setdefault("$schema", CONFIG_SCHEMA)
+    mcp["telegram"] = desired
     _write_config(config)
     return True
 
@@ -78,8 +89,8 @@ def _skill_text() -> str:
         "the call (resolved from the session, or from the session working "
         "directory when the session id is unavailable).\n\n"
         "If the MCP tool is unavailable, run the CLI instead:\n\n"
-        f'    "{sys.executable}" "{SEND_MEDIA_PATH}" "<absolute path>" '
-        '--caption "<optional>"\n\n'
+        '    ' + " ".join(f'"{part}"' for part in send_media_command())
+        + ' "<absolute path>" --caption "<optional>"\n\n'
         "Rules:\n"
         "- Use an absolute path to a file that already exists.\n"
         "- The file must be at most MEDIA_MAX_MB megabytes.\n"

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opencode-voice"
+dynamic = ["version"]
+description = "Telegram bridge for opencode with a local control panel and service installer"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "python-telegram-bot[webhooks]~=22.0",
+    "python-dotenv",
+    "httpx",
+    "edge-tts",
+    "psutil",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "build"]
+
+[project.scripts]
+opencode-voice = "control.cli:main"
+ocv = "control.cli:main"
+
+[tool.setuptools]
+py-modules = ["config"]
+
+[tool.setuptools.packages.find]
+include = ["control*", "opencode_client*", "stt*", "telegram_bot*", "tts*"]
+
+[tool.setuptools.package-data]
+control = ["web/*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "control.__version__" }

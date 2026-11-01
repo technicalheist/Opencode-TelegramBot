@@ -18,3 +18,10 @@ media/
 logs/
 run/
 .playwright-mcp/
+
+# Build output
+build/
+dist/
+
+# Packaging
+*.egg-info/

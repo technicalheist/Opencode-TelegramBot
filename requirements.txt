@@ -4,5 +4,7 @@ httpx
 edge-tts
 mcp
 psutil
+fastapi>=0.115
+uvicorn[standard]>=0.30
 pytest
 pytest-asyncio

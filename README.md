@@ -110,6 +110,7 @@ On macOS/Linux use `python3 -m venv .venv` and `.venv/bin/python`.
 | `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP basic auth username for the default server (opencode v2) |
 | `OPENCODE_SERVER_PASSWORD` | — | HTTP basic auth password for the opencode background service (**required** by opencode v2; used for localhost too) |
 | `MEDIA_MAX_MB` | `20` | Max size for bridged media |
+| `OPENCODE_COMMAND` | `opencode` | CLI the desktop panel uses to start/stop the server |
 | `TELEGRAM_WEBHOOK_URL` | — | Public HTTPS base URL; **empty = long polling** |
 | `TELEGRAM_WEBHOOK_PORT` | `8080` | Local port the webhook server listens on |
 | `TELEGRAM_WEBHOOK_PATH` | — | Secret path segment Telegram posts to |
@@ -159,6 +160,81 @@ directly:
 ```powershell
 .venv\Scripts\python -m telegram_bot.bot
 ```
+
+## Control panel (local service)
+
+`python -m control` (or the installed `opencode-voice` / `ocv` command) serves a
+local web panel that starts/stops the bot and the opencode server, edits every
+setting, and streams the bot log. It stores its data inside opencode's own
+config directory:
+
+```
+~/.config/opencode/opencode-voice/
+├── .env          # the same settings the bot reads
+├── data/bot.db
+├── media/
+└── logs/bot.log
+```
+
+```powershell
+ocv                                       # serve + open http://127.0.0.1:8787
+ocv status                                # opencode / bot / mode
+ocv config list
+ocv config set LOG_LEVEL=DEBUG
+ocv config import .env                    # migrate an existing settings file
+ocv logs -f
+```
+
+The panel binds loopback only and creates a random admin token in
+`run/admin-token`; open the URL printed on start (`/?t=<token>`) so the cookie is
+set. `X-OCV: 1` is required on mutating requests and the `Host` header must be
+loopback (DNS-rebinding guard).
+
+Install it as a per-user background service (no admin rights):
+
+```powershell
+ocv service install --port 8787   # Windows Scheduled Task / launchd / systemd --user
+ocv service status
+ocv service uninstall             # leaves settings and data in place
+```
+
+The bot runs as a child process of the panel (PTB owns signals and blocks for
+the process lifetime), so the panel can restart it cleanly and stream its output.
+
+### Installing as a package
+
+The project is a normal Python package (`pyproject.toml`) — there is no binary
+build step. `uv` is the recommended installer because it gives each tool its own
+environment, so the generic top-level modules (`config`, `stt`, `tts`,
+`opencode_client`, `telegram_bot`, `control`) cannot collide with anything.
+
+```bash
+# straight from a git tag (needs git, no artifacts to download)
+uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0a1" opencode-voice
+
+# straight from the release wheel (no git needed)
+uv tool install --from "https://github.com/technicalheist/Opencode-TelegramBot/releases/download/v0.1.0a1/opencode_voice-0.1.0a1-py3-none-any.whl" opencode-voice
+
+# from a local checkout
+uv tool install --from . opencode-voice
+
+ocv --help
+uv tool uninstall opencode-voice
+```
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests, verifies the
+tag matches `control.__version__`, builds the wheel + sdist and attaches them to
+the GitHub release — so both install forms above point at the same code.
+
+To run it once without installing: `uvx --from <same-url> ocv status`.
+
+```powershell
+pipx install .        # pipx works the same way
+pip install -e .      # or editable, into the project venv
+```
+
+Avoid a plain global `pip install` into a shared environment for the reason
+above.
 
 ## Webhook mode (cloudflared)
 

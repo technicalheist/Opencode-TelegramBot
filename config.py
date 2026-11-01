@@ -6,7 +6,25 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT_DIR = Path(__file__).resolve().parent
-ENV_FILE = ROOT_DIR / ".env"
+
+
+def _default_env_file() -> Path:
+    """Repo ``.env`` in a checkout, otherwise the installed app's config dir."""
+    repo_env = ROOT_DIR / ".env"
+    if repo_env.exists():
+        return repo_env
+    from control import paths
+
+    return paths.config_dir() / ".env"
+
+
+# ``OCV_ENV_FILE`` lets a caller point at a specific settings file (the panel
+# always sets it). Without it, a source checkout keeps using its root ``.env``.
+ENV_FILE = Path(os.environ.get("OCV_ENV_FILE") or _default_env_file())
+
+# Root for relative ``DB_PATH``/``MEDIA_DIR``/``OPENCODE_DIRECTORY`` values.
+# ``OCV_HOME`` wins; the CLI sets it when the settings live in the app dir.
+HOME_DIR = Path(os.environ.get("OCV_HOME") or ROOT_DIR)
 
 # The root ``.env`` is the single source of truth for configuration; override
 # any value that happens to be exported in the shell so the bot, the launcher,
@@ -32,7 +50,7 @@ def _env(name: str, default: str = "") -> str:
 def _resolve_path(raw_value: str | None, default: str) -> Path:
     candidate = Path(raw_value.strip() if raw_value and raw_value.strip() else default)
     if not candidate.is_absolute():
-        candidate = ROOT_DIR / candidate
+        candidate = HOME_DIR / candidate
     return candidate.resolve()
 
 
@@ -89,6 +107,8 @@ OPENCODE_BASE_URL: str = _env("OPENCODE_BASE_URL", "http://localhost:4096")
 OPENCODE_DIRECTORY: Path = _resolve_path(os.getenv("OPENCODE_DIRECTORY"), ".")
 OPENCODE_AGENT: str = _env("OPENCODE_AGENT", "build")
 OPENCODE_TIMEOUT: float = _parse_opencode_timeout()
+# CLI used by the desktop panel to start/stop the background server.
+OPENCODE_COMMAND: str = _env("OPENCODE_COMMAND", "opencode")
 # opencode v2 protects `serve`/`web` with HTTP basic auth when a password is set.
 # The username defaults to "opencode" (opencode's own default). These credentials
 # apply to the default server (OPENCODE_BASE_URL) for localhost too.

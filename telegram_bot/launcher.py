@@ -25,7 +25,15 @@ logger = logging.getLogger(__name__)
 HEALTH_PATHS = ("/api/info", "/api/health", "/global/health")
 
 
-def _health_auth() -> Optional[httpx.BasicAuth]:
+def _health_auth(auth: Optional[httpx.Auth] = None) -> Optional[httpx.Auth]:
+    """Return ``auth`` unchanged, else the configured default-server credentials.
+
+    The desktop panel resolves credentials from its own settings file and must
+    not import ``config`` (which raises when ``ADMIN_USER_ID`` is unset), so it
+    passes an explicit ``httpx.BasicAuth`` here.
+    """
+    if auth is not None:
+        return auth
     credentials = config.opencode_server_credentials()
     if credentials is None:
         return None
@@ -33,9 +41,14 @@ def _health_auth() -> Optional[httpx.BasicAuth]:
     return httpx.BasicAuth(username, password)
 
 
-def is_healthy(base_url: str, *, timeout: float = 2.0) -> bool:
+def is_healthy(
+    base_url: str,
+    *,
+    timeout: float = 2.0,
+    auth: Optional[httpx.Auth] = None,
+) -> bool:
     base = (base_url or "").rstrip("/")
-    auth = _health_auth()
+    auth = _health_auth(auth)
     for path in HEALTH_PATHS:
         try:
             response = httpx.get(f"{base}{path}", timeout=timeout, auth=auth)

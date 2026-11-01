@@ -316,12 +316,59 @@ them; the default is the configured `OPENCODE_BASE_URL`.
       pending URL input, multi-server client selection, and event
       subscriptions.
 
+### Phase 16 - local control panel + installable service (DONE)
+The bot could only be run from a terminal, and every setting lived in a
+hand-edited `.env`. A local web panel now supervises it, exposed through a CLI and
+installable as a per-user OS service. Distribution is a normal Python package
+(`pyproject.toml`); the earlier single-file PyInstaller build was dropped.
+
+- [x] `control/` package (never imports `config`, which raises at import time
+      when mandatory keys are missing):
+      `paths` (app dir, commands), `settings` (schema + atomic `.env` IO),
+      `manager` (bot child process + opencode CLI/health), `service` (systemd /
+      launchd / Scheduled Task), `api` (FastAPI + SSE), `cli` (dispatcher),
+      `web/` (vanilla HTML/CSS/JS).
+- [x] Settings live in `~/.config/opencode/opencode-voice/.env`, so opencode's
+      presence is the only host dependency; `data/`, `media/` and `logs/` sit
+      beside it.
+- [x] `config.py` honours `OCV_ENV_FILE` (settings file) and `OCV_HOME` (root for
+      relative paths), falling back to the app dir when installed;
+      `OPENCODE_COMMAND` selects the CLI.
+- [x] The bot runs as a **child process** (`control bot`) because PTB installs
+      signal handlers and blocks for the process lifetime; the panel restarts it
+      and streams its log (`logs/bot.log`, tail + SSE). The child also exits when
+      the panel dies (parent watchdog), so a restart cannot leave two pollers.
+- [x] opencode is controlled with `opencode service start|stop` and probed via
+      `GET /api/info` with the configured basic auth: `running` / `stopped` /
+      `unauthorized` / `missing`.
+- [x] Start bot = ensure opencode healthy → spawn; a 401 is reported as a
+      password mismatch instead of a generic failure.
+- [x] Panel auth: loopback-only bind, random token in `run/admin-token`, cookie
+      set by `/?t=<token>`, `X-OCV: 1` required on mutations, `Host` allowlist.
+- [x] `opencode_setup` updates a stale `mcp.telegram` command instead of skipping.
+- [x] `pyproject.toml` provides the `opencode-voice` / `ocv` console scripts and
+      ships `control/web/*` as package data (wheel + sdist). Verified installed
+      with `uv tool install --from .` and from a git tag; a `v*` tag runs
+      `.github/workflows/release.yml` (test → version check → build → attach the
+      wheel/sdist to the GitHub release).
+- [x] Tests (no network): paths, settings, manager (fake popen/probe), service
+      unit rendering + command construction, API (TestClient + FakeManager), CLI.
+
+### Phase 17 - opencode service password drift (OPEN)
+The live server (`opencode v2.2.5`, started via `opencode service start`) began
+rejecting `OPENCODE_SERVER_PASSWORD` from `.env`, so the bot's event stream and
+`/api/info` return 401 (`the server rejected the configured credentials`). The
+panel surfaces it; the fix is to restart the server with the same environment.
+
 ## Tech Stack
 
 | Concern        | Choice                                                        |
 | -------------- | ------------------------------------------------------------- |
 | Language       | Python 3.14 (available as `python`)                           |
 | Bot framework  | `python-telegram-bot` v22.x (async API), long polling         |
+| Control panel  | FastAPI + uvicorn, served on `127.0.0.1:8787`                  |
+| Panel frontend | vanilla HTML/CSS/JS in `control/web/` (no build step)         |
+| Distribution   | Python package (`pyproject.toml`), `ocv` console script      |
 | Persistence    | SQLite via stdlib `sqlite3`                                    |
 | STT            | OpenRouter `POST /api/v1/audio/transcriptions` via `httpx`     |
 | TTS            | `edge-tts` (`edge_tts.Communicate`, async)                    |
@@ -339,7 +386,19 @@ opencode-voice/
 ├── .env                    # all secrets (gitignored)
 ├── .env.example            # documented placeholders
 ├── requirements.txt
+├── requirements-dev.txt    # + pytest/build tooling
+├── pyproject.toml          # package metadata + `ocv` console script
 ├── config.py               # shared env parsing, paths, constants
+├── control/                # local control panel (web + CLI + OS service)
+│   ├── __init__.py         # __version__
+│   ├── __main__.py         # `python -m control`
+│   ├── cli.py              # serve / bot / mcp-server / status / config / ...
+│   ├── paths.py            # app dir under ~/.config/opencode, commands
+│   ├── settings.py         # settings schema + atomic .env read/write
+│   ├── manager.py          # bot child process + opencode CLI/health
+│   ├── service.py          # systemd / launchd / Scheduled Task install
+│   ├── api.py              # FastAPI routes, auth, SSE log stream
+│   └── web/                # index.html, app.js, style.css
 ├── telegram_bot/
 │   ├── __init__.py
 │   ├── bot.py              # entrypoint (async main, SSE listener, handlers)
@@ -645,6 +704,7 @@ OPENCODE_BASE_URL=http://localhost:4096
 OPENCODE_DIRECTORY=            # empty -> repo root
 OPENCODE_AGENT=build
 OPENCODE_TIMEOUT=600           # seconds for a blocking prompt
+OPENCODE_COMMAND=opencode      # CLI the panel uses to start/stop the server
 OPENCODE_SERVER_USERNAME=opencode  # HTTP basic auth username (opencode v2)
 OPENCODE_SERVER_PASSWORD=<password>  # HTTP basic auth password (required by v2)
 MEDIA_MAX_MB=20                # max size for inbound/outbound media bridging
@@ -702,6 +762,17 @@ python -m venv .venv
 
 # run the bot (start `opencode service start` yourself first, with the .env password)
 .venv\Scripts\python -m telegram_bot
+
+# run the control panel (starts/stops the bot and the server for you)
+.venv\Scripts\python -m control
+.venv\Scripts\python -m control status
+.venv\Scripts\python -m control config set LOG_LEVEL=DEBUG
+.venv\Scripts\python -m control service install --port 8787
+
+# install as a tool (gives `ocv` / `opencode-voice` on PATH)
+uv tool install --from . opencode-voice
+uv tool install --from "git+https://github.com/technicalheist/Opencode-TelegramBot.git@v0.1.0a1" opencode-voice
+uv tool uninstall opencode-voice
 
 # tests
 .venv\Scripts\python -m pytest tests

@@ -53,9 +53,29 @@ def test_install_mcp_config_preserves_existing_keys(setup_paths):
     assert config["$schema"] == opencode_setup.CONFIG_SCHEMA
 
 
-def test_install_mcp_config_skips_when_present(setup_paths):
+def test_install_mcp_config_updates_stale_command(setup_paths):
     opencode_setup.GLOBAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     existing = {"mcp": {"telegram": {"type": "local", "command": ["x"]}}}
+    opencode_setup.GLOBAL_CONFIG.write_text(json.dumps(existing), encoding="utf-8")
+
+    result = opencode_setup.install_mcp_config()
+
+    assert result is True
+    command = _load(opencode_setup.GLOBAL_CONFIG)["mcp"]["telegram"]["command"]
+    assert command == opencode_setup.mcp_command()
+
+
+def test_install_mcp_config_skips_when_identical(setup_paths):
+    opencode_setup.GLOBAL_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    existing = {
+        "mcp": {
+            "telegram": {
+                "type": "local",
+                "command": opencode_setup.mcp_command(),
+                "enabled": True,
+            }
+        }
+    }
     opencode_setup.GLOBAL_CONFIG.write_text(json.dumps(existing), encoding="utf-8")
     before = opencode_setup.GLOBAL_CONFIG.read_text(encoding="utf-8")
 
@@ -63,6 +83,11 @@ def test_install_mcp_config_skips_when_present(setup_paths):
 
     assert result is False
     assert opencode_setup.GLOBAL_CONFIG.read_text(encoding="utf-8") == before
+
+
+def test_commands_use_the_script_paths():
+    assert opencode_setup.mcp_command()[1].endswith("mcp_server.py")
+    assert opencode_setup.send_media_command()[1].endswith("send_media.py")
 
 
 def test_install_mcp_config_leaves_invalid_json_untouched(setup_paths):
